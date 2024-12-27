@@ -10,6 +10,7 @@ import (
 	"math"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -17,9 +18,25 @@ import (
 )
 
 const (
-	maxBackoffDuration = 1 * time.Minute
+	// Connection management
+	maxBackoffDuration = 2 * time.Minute
 	initialBackoff     = 1 * time.Second
 	backoffFactor      = 2.0
+	connectionCooldown = 30 * time.Second
+	defaultInitTimeout = 2 * time.Minute
+	keepAliveTime      = 30 * time.Second
+	keepAliveTimeout   = 10 * time.Second
+
+	// Health check parameters
+	healthCheckInterval = 15 * time.Second
+	maxFailureCount     = 3
+	reconnectDelay      = 5 * time.Second
+
+	// Connection states
+	stateDisconnected = "disconnected"
+	stateConnecting   = "connecting"
+	stateConnected    = "connected"
+	stateError        = "error"
 )
 
 // EtcdRegistry is a library for registering and retrieving service nodes from etcd.
@@ -30,6 +47,22 @@ type EtcdRegistry struct {
 	etcdEndpoints  []string
 	defaultTimeout time.Duration
 	logger         *logrus.Entry
+
+	// Connection management
+	client          *clientv3.Client
+	clientMutex     sync.RWMutex
+	connectionState string
+	failureCount    int
+	lastFailure     time.Time
+
+	// Lifecycle management
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	// Health monitoring
+	healthTicker *time.Ticker
+	keepAliveCh  <-chan *clientv3.LeaseKeepAliveResponse
 }
 
 // Node represents a registered service node.
@@ -63,15 +96,54 @@ func NewEtcdRegistry(etcdEndpoints []string, etcdBasePath string, etcdUsername s
 		"endpoints": strings.Join(etcdEndpoints, ","),
 	})
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	r := &EtcdRegistry{
-		defaultTimeout: defaultTimeout,
-		etcdBasePath:   etcdBasePath,
-		etcdEndpoints:  etcdEndpoints,
-		etcdUsername:   etcdUsername,
-		etcdPassword:   etcdPassword,
-		logger:         logger,
+		defaultTimeout:  defaultTimeout,
+		etcdBasePath:    etcdBasePath,
+		etcdEndpoints:   etcdEndpoints,
+		etcdUsername:    etcdUsername,
+		etcdPassword:    etcdPassword,
+		logger:          logger,
+		ctx:             ctx,
+		cancel:          cancel,
+		connectionState: stateDisconnected,
+		healthTicker:    time.NewTicker(healthCheckInterval),
 	}
+
+	// Start health monitoring
+	r.wg.Add(1)
+	go r.monitorHealth()
+
+	// Initialize connection
+	if err := r.connect(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to initialize connection: %w", err)
+	}
+
 	return r, nil
+}
+
+// Close gracefully shuts down the registry
+func (r *EtcdRegistry) Close() error {
+	r.cancel()
+	r.healthTicker.Stop()
+
+	// Wait for all goroutines to finish
+	r.wg.Wait()
+
+	// Close client connection
+	r.clientMutex.Lock()
+	defer r.clientMutex.Unlock()
+
+	if r.client != nil {
+		if err := r.client.Close(); err != nil {
+			return fmt.Errorf("failed to close etcd client: %w", err)
+		}
+		r.client = nil
+	}
+
+	return nil
 }
 
 // RegisterNode registers a new Node to a service with a TTL.
@@ -331,73 +403,20 @@ func (r *EtcdRegistry) GetServiceNodes(serviceName string) ([]Node, error) {
 // It handles both authenticated and non-authenticated connections, and validates
 // the connection is working before returning.
 func (r *EtcdRegistry) initializeETCDClient() (*clientv3.Client, error) {
-	logger := r.logger.WithField("operation", "initialize_client")
+	r.clientMutex.RLock()
+	if r.client != nil && r.connectionState == stateConnected {
+		defer r.clientMutex.RUnlock()
+		return r.client, nil
+	}
+	r.clientMutex.RUnlock()
 
-	if len(r.etcdEndpoints) == 0 {
-		return nil, fmt.Errorf("no etcd endpoints provided")
+	if err := r.connect(); err != nil {
+		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), r.defaultTimeout)
-	defer cancel()
-
-	config := clientv3.Config{
-		Endpoints:   r.etcdEndpoints,
-		DialTimeout: r.defaultTimeout,
-		Context:     ctx,
-	}
-
-	if r.etcdUsername != "" && r.etcdPassword != "" {
-		config.Username = r.etcdUsername
-		config.Password = r.etcdPassword
-		logger.Debug("Using authenticated connection")
-	} else {
-		logger.Debug("Using unauthenticated connection")
-	}
-
-	cli, err := clientv3.New(config)
-	if err != nil {
-		logger.WithError(err).Error("Failed to create etcd client")
-		return nil, fmt.Errorf("failed to create etcd client: %w", err)
-	}
-
-	success := false
-	defer func() {
-		if !success {
-			err := cli.Close()
-			if err != nil {
-				logger.WithError(err).Error("Failed to close etcd client")
-			}
-		}
-	}()
-
-	statusCtx, statusCancel := context.WithTimeout(ctx, r.defaultTimeout)
-	defer statusCancel()
-
-	_, err = cli.Status(statusCtx, r.etcdEndpoints[0])
-	if err != nil {
-		if strings.Contains(err.Error(), "authentication is not enabled") && (r.etcdUsername != "" || r.etcdPassword != "") {
-			logger.Info("Authentication is disabled on server, retrying without credentials")
-			r.etcdUsername = ""
-			r.etcdPassword = ""
-			return r.initializeETCDClient()
-		}
-		logger.WithError(err).Error("Failed to connect to etcd")
-		return nil, fmt.Errorf("failed to connect to etcd: %w", err)
-	}
-
-	checkCtx, checkCancel := context.WithTimeout(ctx, r.defaultTimeout)
-	defer checkCancel()
-
-	_, err = cli.Get(checkCtx, r.etcdBasePath)
-	if err != nil {
-		logger.WithError(err).Error("Failed to access base path")
-		return nil, fmt.Errorf("failed to access base path '%s': %w", r.etcdBasePath, err)
-	}
-
-	success = true
-	logger.Info("Successfully connected to etcd cluster")
-
-	return cli, nil
+	r.clientMutex.RLock()
+	defer r.clientMutex.RUnlock()
+	return r.client, nil
 }
 
 // encode encodes a map to a JSON string.
@@ -434,4 +453,140 @@ func (r *EtcdRegistry) nodePath(serviceName string, nodeName string) string {
 	service := strings.Replace(serviceName, "/", "-", -1)
 	node := strings.Replace(nodeName, "/", "-", -1)
 	return path.Join(r.etcdBasePath, service, node)
+}
+
+// connect establishes a new connection to etcd
+func (r *EtcdRegistry) connect() error {
+	r.clientMutex.Lock()
+	defer r.clientMutex.Unlock()
+
+	if r.connectionState == stateConnecting {
+		return fmt.Errorf("connection already in progress")
+	}
+
+	r.connectionState = stateConnecting
+	r.logger.Info("Establishing connection to etcd")
+
+	config := clientv3.Config{
+		Endpoints:            r.etcdEndpoints,
+		DialTimeout:          r.defaultTimeout,
+		DialKeepAliveTime:    keepAliveTime,
+		DialKeepAliveTimeout: keepAliveTimeout,
+		Context:              r.ctx,
+	}
+
+	if r.etcdUsername != "" && r.etcdPassword != "" {
+		config.Username = r.etcdUsername
+		config.Password = r.etcdPassword
+	}
+
+	client, err := clientv3.New(config)
+	if err != nil {
+		r.connectionState = stateError
+		r.failureCount++
+		r.lastFailure = time.Now()
+		return fmt.Errorf("failed to create etcd client: %w", err)
+	}
+
+	// Validate connection
+	ctx, cancel := context.WithTimeout(r.ctx, r.defaultTimeout)
+	defer cancel()
+
+	if _, err := client.Status(ctx, r.etcdEndpoints[0]); err != nil {
+		r.connectionState = stateError
+		r.failureCount++
+		r.lastFailure = time.Now()
+		client.Close()
+		return fmt.Errorf("failed to validate connection: %w", err)
+	}
+
+	// Update client reference
+	if r.client != nil {
+		r.client.Close()
+	}
+	r.client = client
+	r.connectionState = stateConnected
+	r.failureCount = 0
+
+	r.logger.Info("Successfully connected to etcd")
+	return nil
+}
+
+// monitorHealth continuously monitors connection health
+func (r *EtcdRegistry) monitorHealth() {
+	defer r.wg.Done()
+
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+
+		case <-r.healthTicker.C:
+			if err := r.checkHealth(); err != nil {
+				r.logger.WithError(err).Warn("Health check failed")
+
+				if r.failureCount >= maxFailureCount {
+					r.logger.Error("Max failures reached, attempting reconnection")
+					if err := r.reconnect(); err != nil {
+						r.logger.WithError(err).Error("Reconnection failed")
+					}
+				}
+			}
+		}
+	}
+}
+
+// checkHealth validates the current connection
+func (r *EtcdRegistry) checkHealth() error {
+	r.clientMutex.RLock()
+	defer r.clientMutex.RUnlock()
+
+	if r.client == nil {
+		return fmt.Errorf("no active connection")
+	}
+
+	ctx, cancel := context.WithTimeout(r.ctx, keepAliveTimeout)
+	defer cancel()
+
+	_, err := r.client.Status(ctx, r.etcdEndpoints[0])
+	if err != nil {
+		r.failureCount++
+		r.lastFailure = time.Now()
+		return fmt.Errorf("health check failed: %w", err)
+	}
+
+	return nil
+}
+
+// reconnect attempts to reestablish the connection with backoff
+func (r *EtcdRegistry) reconnect() error {
+	backoff := initialBackoff
+
+	for attempt := 1; ; attempt++ {
+		if err := r.connect(); err != nil {
+			if time.Since(r.lastFailure) < connectionCooldown {
+				time.Sleep(connectionCooldown)
+			}
+
+			backoff = time.Duration(float64(initialBackoff) * math.Pow(backoffFactor, float64(attempt-1)))
+			if backoff > maxBackoffDuration {
+				backoff = maxBackoffDuration
+			}
+
+			r.logger.WithFields(logrus.Fields{
+				"attempt": attempt,
+				"backoff": backoff,
+				"error":   err,
+			}).Warn("Reconnection attempt failed")
+
+			select {
+			case <-r.ctx.Done():
+				return fmt.Errorf("context cancelled during reconnection")
+			case <-time.After(backoff):
+				continue
+			}
+		}
+
+		return nil
+	}
 }
