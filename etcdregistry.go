@@ -7,8 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/backoff"
 	"math"
 	"path"
 	"strings"
@@ -263,76 +261,45 @@ func (r *EtcdRegistry) RegisterNode(ctx context.Context, serviceName string, nod
 }
 
 func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, node Node, ttl time.Duration) error {
-	logger := r.logger.WithFields(logrus.Fields{
-		"service": serviceName,
-		"node":    node.Name,
-		"ttl":     ttl.String(),
-	})
+	// Create timeout context for the entire operation
+	opCtx, cancel := context.WithTimeout(ctx, r.defaultTimeout)
+	defer cancel()
 
 	// Initialize etcd client
-	cli, err := r.initializeETCDClient()
-	if err != nil {
-		return fmt.Errorf("failed to initialize etcd client: %w", err)
+	if r.client == nil {
+		return fmt.Errorf("client not initialized")
 	}
-	defer func(cli *clientv3.Client) {
-		err := cli.Close()
-		if err != nil {
-			logger.WithError(err).Error("Failed to close etcd client")
-		}
-	}(cli)
 
-	// Create lease
-	leaseCtx, leaseCancel := context.WithTimeout(ctx, r.defaultTimeout)
-	defer leaseCancel()
-
-	lease, err := cli.Grant(leaseCtx, int64(ttl.Seconds()))
+	// Create lease with timeout context
+	lease, err := r.client.Grant(opCtx, int64(ttl.Seconds()))
 	if err != nil {
 		return fmt.Errorf("failed to grant lease: %w", err)
 	}
 
-	logger.WithField("lease_id", lease.ID).Debug("Lease granted")
-
-	// Register node
-	putCtx, putCancel := context.WithTimeout(ctx, r.defaultTimeout)
-	defer putCancel()
-
+	// Put with lease using timeout context
 	nodePath := r.nodePath(serviceName, node.Name)
 	nodeData := encode(node.Info)
 
-	_, err = cli.Put(putCtx, nodePath, nodeData, clientv3.WithLease(lease.ID))
+	_, err = r.client.Put(opCtx, nodePath, nodeData, clientv3.WithLease(lease.ID))
 	if err != nil {
 		return fmt.Errorf("failed to put node data: %w", err)
 	}
 
-	logger.WithFields(logrus.Fields{
-		"path": nodePath,
-		"data": nodeData,
-	}).Debug("Node data written to etcd")
-
-	// Start keepalive
-	keepAlive, err := cli.KeepAlive(ctx, lease.ID)
+	// Start keepalive with parent context (not timeout context)
+	keepAlive, err := r.client.KeepAlive(ctx, lease.ID)
 	if err != nil {
 		return fmt.Errorf("failed to start keepalive: %w", err)
 	}
 
 	// Monitor keepalive in separate goroutine
 	go func() {
-		keepAliveLogger := logger.WithField("lease_id", lease.ID)
-		keepAliveLogger.Info("Starting keepalive monitoring")
-
-		for {
+		for range keepAlive {
+			// Just consume the channel
 			select {
-			case resp, ok := <-keepAlive:
-				if !ok {
-					keepAliveLogger.Warn("Keepalive channel closed")
-					return
-				}
-				keepAliveLogger.WithFields(logrus.Fields{
-					"ttl": resp.TTL,
-				}).Debug("Received keepalive response")
 			case <-ctx.Done():
-				keepAliveLogger.WithError(ctx.Err()).Info("Keepalive monitoring stopped due to context cancellation")
 				return
+			default:
+				continue
 			}
 		}
 	}()
@@ -351,60 +318,26 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 //	[]Node: A list of active service nodes.
 //	error: An error if the nodes could not be retrieved.
 func (r *EtcdRegistry) GetServiceNodes(serviceName string) ([]Node, error) {
-	logger := r.logger.WithField("service", serviceName)
-
-	if serviceName == "" {
-		return nil, fmt.Errorf("service name cannot be empty")
+	if r.client == nil {
+		return nil, fmt.Errorf("client not initialized")
 	}
-
-	cli, err := r.initializeETCDClient()
-	if err != nil {
-		logger.WithError(err).Error("Failed to initialize etcd client")
-		return nil, err
-	}
-	defer func(cli *clientv3.Client) {
-		err := cli.Close()
-		if err != nil {
-			logger.WithError(err).Error("Failed to close etcd client")
-		}
-	}(cli)
 
 	ctx, cancel := context.WithTimeout(context.Background(), r.defaultTimeout)
 	defer cancel()
 
 	servicePath := r.servicePath(serviceName)
-	logger.WithField("path", servicePath).Debug("Fetching service nodes")
-
-	rsp, err := cli.Get(ctx, servicePath+"/", clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortDescend))
+	rsp, err := r.client.Get(ctx, servicePath+"/", clientv3.WithPrefix())
 	if err != nil {
-		logger.WithError(err).Error("Failed to get service nodes")
 		return nil, err
 	}
 
 	nodes := make([]Node, 0)
-
-	if len(rsp.Kvs) == 0 {
-		logger.Debug("No service nodes found")
-		return nodes, nil
-	}
-
 	for _, n := range rsp.Kvs {
 		nodeName := strings.TrimPrefix(string(n.Key), servicePath+"/")
 		nodeInfo := decode(n.Value)
-
-		node := Node{
-			Name: nodeName,
-			Info: nodeInfo,
-		}
-		nodes = append(nodes, node)
-
-		logger.WithFields(logrus.Fields{
-			"node": nodeName,
-			"info": nodeInfo,
-		}).Debug("Found service node")
+		nodes = append(nodes, Node{Name: nodeName, Info: nodeInfo})
 	}
 
-	logger.WithField("count", len(nodes)).Info("Successfully retrieved service nodes")
 	return nodes, nil
 }
 
@@ -466,107 +399,21 @@ func (r *EtcdRegistry) nodePath(serviceName string, nodeName string) string {
 
 // connect establishes a new connection to etcd
 func (r *EtcdRegistry) connect() error {
-	r.clientMutex.Lock()
-	defer r.clientMutex.Unlock()
-
-	if r.connectionState == stateConnecting {
-		return fmt.Errorf("connection already in progress")
-	}
-
-	r.connectionState = stateConnecting
-	r.logger.Info("Establishing connection to etcd")
-
-	// Create connection parameters for stability
-	connParams := grpc.ConnectParams{
-		Backoff: backoff.Config{
-			BaseDelay:  1.0 * time.Second,
-			Multiplier: 1.6,
-			Jitter:     0.2,
-			MaxDelay:   120 * time.Second,
-		},
-		MinConnectTimeout: 20 * time.Second,
-	}
-
-	// Create GRPC options for connection stability
-	grpcOpts := []grpc.DialOption{
-		grpc.WithConnectParams(connParams),
-		grpc.WithReturnConnectionError(),
-		grpc.WithBlock(),
-		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
-	}
-
 	config := clientv3.Config{
 		Endpoints:            r.etcdEndpoints,
-		DialTimeout:          dialTimeout,
-		DialKeepAliveTime:    keepAliveTime,
-		DialKeepAliveTimeout: keepAliveTimeout,
-		DialOptions:          grpcOpts,
-		Context:              r.ctx,
-		RejectOldCluster:     true,
-		AutoSyncInterval:     5 * time.Minute,
+		DialTimeout:          5 * time.Second,
+		DialKeepAliveTime:    2 * time.Second,
+		DialKeepAliveTimeout: 1 * time.Second,
+		AutoSyncInterval:     1 * time.Minute,
 		PermitWithoutStream:  true,
 	}
 
-	if r.etcdUsername != "" && r.etcdPassword != "" {
-		config.Username = r.etcdUsername
-		config.Password = r.etcdPassword
-	}
-
-	// Create client with retry
-	var client *clientv3.Client
-	var err error
-	for attempt := 0; attempt < maxRetryAttempts; attempt++ {
-		if attempt > 0 {
-			r.logger.WithField("attempt", attempt+1).Info("Retrying connection")
-			time.Sleep(time.Duration(attempt) * time.Second)
-		}
-
-		client, err = clientv3.New(config)
-		if err == nil {
-			break
-		}
-		r.logger.WithError(err).WithField("attempt", attempt+1).Warn("Connection attempt failed")
-	}
-
+	client, err := clientv3.New(config)
 	if err != nil {
-		r.connectionState = stateError
-		r.failureCount++
-		r.lastFailure = time.Now()
-		return fmt.Errorf("failed to create etcd client after %d attempts: %w", maxRetryAttempts, err)
-	}
-
-	// Validate connection with retry
-	ctx, cancel := context.WithTimeout(r.ctx, r.defaultTimeout)
-	defer cancel()
-
-	for attempt := 0; attempt < maxRetryAttempts; attempt++ {
-		if attempt > 0 {
-			time.Sleep(time.Duration(attempt) * time.Second)
-		}
-
-		if _, err := client.Status(ctx, r.etcdEndpoints[0]); err == nil {
-			break
-		} else if attempt == maxRetryAttempts-1 {
-			r.connectionState = stateError
-			r.failureCount++
-			r.lastFailure = time.Now()
-			client.Close()
-			return fmt.Errorf("failed to validate connection after %d attempts: %w", maxRetryAttempts, err)
-		}
-	}
-
-	// Update client reference
-	if r.client != nil {
-		if err := r.client.Close(); err != nil {
-			r.logger.WithError(err).Warn("Error closing old client")
-		}
+		return fmt.Errorf("failed to create client: %w", err)
 	}
 
 	r.client = client
-	r.connectionState = stateConnected
-	r.failureCount = 0
-
-	r.logger.Info("Successfully connected to etcd")
 	return nil
 }
 
