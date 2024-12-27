@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"path"
 	"strings"
 	"time"
@@ -15,25 +16,25 @@ import (
 	"go.etcd.io/etcd/client/v3"
 )
 
+const (
+	maxBackoffDuration = 1 * time.Minute
+	initialBackoff     = 1 * time.Second
+	backoffFactor      = 2.0
+)
+
 // EtcdRegistry is a library for registering and retrieving service nodes from etcd.
 type EtcdRegistry struct {
-	// etcdBasePath is the base path for all etcd operations.
-	etcdBasePath string
-	// etcdUsername is the username for etcd authentication.
-	etcdUsername string
-	// etcdPassword is the password for etcd authentication.
-	etcdPassword string
-	// etcdEndpoints are the endpoints for the etcd cluster.
-	etcdEndpoints []string
-	// defaultTimeout is the default timeout for etcd operations.
+	etcdBasePath   string
+	etcdUsername   string
+	etcdPassword   string
+	etcdEndpoints  []string
 	defaultTimeout time.Duration
+	logger         *logrus.Entry
 }
 
 // Node represents a registered service node.
 type Node struct {
-	// Name is the name of the node.
 	Name string
-	// Info is a map of additional information about the node.
 	Info map[string]string
 }
 
@@ -55,12 +56,21 @@ func NewEtcdRegistry(etcdEndpoints []string, etcdBasePath string, etcdUsername s
 	if len(etcdEndpoints) == 0 {
 		return nil, fmt.Errorf("etcd endpoints cannot be empty")
 	}
-	r := &EtcdRegistry{}
-	r.defaultTimeout = defaultTimeout
-	r.etcdBasePath = etcdBasePath
-	r.etcdEndpoints = etcdEndpoints
-	r.etcdUsername = etcdUsername
-	r.etcdPassword = etcdPassword
+
+	logger := logrus.WithFields(logrus.Fields{
+		"component": "etcd-registry",
+		"basePath":  etcdBasePath,
+		"endpoints": strings.Join(etcdEndpoints, ","),
+	})
+
+	r := &EtcdRegistry{
+		defaultTimeout: defaultTimeout,
+		etcdBasePath:   etcdBasePath,
+		etcdEndpoints:  etcdEndpoints,
+		etcdUsername:   etcdUsername,
+		etcdPassword:   etcdPassword,
+		logger:         logger,
+	}
 	return r, nil
 }
 
@@ -91,40 +101,52 @@ func (r *EtcdRegistry) RegisterNode(ctx context.Context, serviceName string, nod
 		return nil, nil, fmt.Errorf("ttl must be > 0")
 	}
 
-	// Create channels for signaling
-	done := make(chan struct{})
-	errChan := make(chan error, 1) // Buffered channel to prevent blocking
+	logger := r.logger.WithFields(logrus.Fields{
+		"service": serviceName,
+		"node":    node.Name,
+		"ttl":     ttl.String(),
+	})
 
-	// Start the registration process in a goroutine
+	done := make(chan struct{})
+	errChan := make(chan error, 1)
+
 	go func() {
-		defer close(errChan) // Ensure channel is closed when goroutine exits
+		defer close(errChan)
 
 		var registered bool
-		backoff := time.Second
+		backoff := initialBackoff
+		attempts := 0
 
 		for {
 			select {
 			case <-ctx.Done():
+				logger.WithError(ctx.Err()).Info("Registration stopped due to context cancellation")
 				errChan <- ctx.Err()
 				return
 			default:
+				attempts++
+				logger.WithField("attempt", attempts).Debug("Attempting node registration")
+
 				err := r.registerNode(ctx, serviceName, node, ttl)
 				if err != nil {
-					logrus.Errorf("Failed to register node %s/%s: %v", serviceName, node.Name, err)
+					logger.WithFields(logrus.Fields{
+						"attempt": attempts,
+						"backoff": backoff.String(),
+						"error":   err,
+					}).Warn("Failed to register node")
 
-					// Send error to error channel if not already registered
 					if !registered {
 						select {
 						case errChan <- err:
 						default:
-							// Channel full, log and continue
-							logrus.Warn("Error channel full, dropping error")
+							logger.Warn("Error channel full, dropping error")
 						}
 					}
 
-					// Exponential backoff with max delay of 1 minute
-					if backoff < time.Minute {
-						backoff *= 2
+					// Calculate next backoff with exponential increase
+					backoff = time.Duration(float64(initialBackoff) * math.Pow(backoffFactor, float64(attempts-1)))
+					if backoff > maxBackoffDuration {
+						backoff = maxBackoffDuration
 					}
 
 					select {
@@ -135,18 +157,21 @@ func (r *EtcdRegistry) RegisterNode(ctx context.Context, serviceName string, nod
 					}
 				}
 
-				// Successful registration
 				if !registered {
 					registered = true
 					close(done)
-					backoff = time.Second // Reset backoff on successful registration
+					logger.Info("Initial registration successful")
+					backoff = initialBackoff
+					attempts = 0
 				}
 
-				// Wait before next registration attempt
+				refreshInterval := ttl / 2
+				logger.WithField("refresh_interval", refreshInterval).Debug("Waiting before next registration attempt")
+
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(ttl / 2): // Refresh at half the TTL interval
+				case <-time.After(refreshInterval):
 					continue
 				}
 			}
@@ -156,31 +181,24 @@ func (r *EtcdRegistry) RegisterNode(ctx context.Context, serviceName string, nod
 	return done, errChan, nil
 }
 
-// keepRegistered keeps the node registered by periodically re-registering it.
-func (r *EtcdRegistry) keepRegistered(ctx context.Context, serviceName string, node Node, ttl time.Duration, done chan struct{}) {
-	for {
-		// Register the node.
-		err := r.registerNode(ctx, serviceName, node, ttl)
-		if err != nil {
-			logrus.Warnf("Registration stopped. Retrying. err=%s", err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		// Close the done channel to signal that the initial registration is complete
-		close(done)
-		logrus.Infof("Registration on ETCD done. Retrying.")
-		time.Sleep(10 * time.Second)
-	}
-}
-
-// registerNode handles a single registration attempt
 func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, node Node, ttl time.Duration) error {
+	logger := r.logger.WithFields(logrus.Fields{
+		"service": serviceName,
+		"node":    node.Name,
+		"ttl":     ttl.String(),
+	})
+
 	// Initialize etcd client
 	cli, err := r.initializeETCDClient()
 	if err != nil {
 		return fmt.Errorf("failed to initialize etcd client: %w", err)
 	}
-	defer cli.Close()
+	defer func(cli *clientv3.Client) {
+		err := cli.Close()
+		if err != nil {
+			logger.WithError(err).Error("Failed to close etcd client")
+		}
+	}(cli)
 
 	// Create lease
 	leaseCtx, leaseCancel := context.WithTimeout(ctx, r.defaultTimeout)
@@ -191,14 +209,24 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 		return fmt.Errorf("failed to grant lease: %w", err)
 	}
 
+	logger.WithField("lease_id", lease.ID).Debug("Lease granted")
+
 	// Register node
 	putCtx, putCancel := context.WithTimeout(ctx, r.defaultTimeout)
 	defer putCancel()
 
-	_, err = cli.Put(putCtx, r.nodePath(serviceName, node.Name), encode(node.Info), clientv3.WithLease(lease.ID))
+	nodePath := r.nodePath(serviceName, node.Name)
+	nodeData := encode(node.Info)
+
+	_, err = cli.Put(putCtx, nodePath, nodeData, clientv3.WithLease(lease.ID))
 	if err != nil {
 		return fmt.Errorf("failed to put node data: %w", err)
 	}
+
+	logger.WithFields(logrus.Fields{
+		"path": nodePath,
+		"data": nodeData,
+	}).Debug("Node data written to etcd")
 
 	// Start keepalive
 	keepAlive, err := cli.KeepAlive(ctx, lease.ID)
@@ -208,16 +236,21 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 
 	// Monitor keepalive in separate goroutine
 	go func() {
+		keepAliveLogger := logger.WithField("lease_id", lease.ID)
+		keepAliveLogger.Info("Starting keepalive monitoring")
+
 		for {
 			select {
 			case resp, ok := <-keepAlive:
 				if !ok {
-					logrus.Warnf("Keepalive channel closed for %s/%s", serviceName, node.Name)
+					keepAliveLogger.Warn("Keepalive channel closed")
 					return
 				}
-				logrus.Debugf("Received keepalive response for %s/%s: TTL=%d", serviceName, node.Name, resp.TTL)
+				keepAliveLogger.WithFields(logrus.Fields{
+					"ttl": resp.TTL,
+				}).Debug("Received keepalive response")
 			case <-ctx.Done():
-				logrus.Infof("Context cancelled for keepalive of %s/%s", serviceName, node.Name)
+				keepAliveLogger.WithError(ctx.Err()).Info("Keepalive monitoring stopped due to context cancellation")
 				return
 			}
 		}
@@ -237,41 +270,60 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 //	[]Node: A list of active service nodes.
 //	error: An error if the nodes could not be retrieved.
 func (r *EtcdRegistry) GetServiceNodes(serviceName string) ([]Node, error) {
-	// Check if the service name is empty.
+	logger := r.logger.WithField("service", serviceName)
+
 	if serviceName == "" {
 		return nil, fmt.Errorf("service name cannot be empty")
 	}
 
-	// Initialize the etcd client.
 	cli, err := r.initializeETCDClient()
 	if err != nil {
+		logger.WithError(err).Error("Failed to initialize etcd client")
 		return nil, err
 	}
+	defer func(cli *clientv3.Client) {
+		err := cli.Close()
+		if err != nil {
+			logger.WithError(err).Error("Failed to close etcd client")
+		}
+	}(cli)
 
-	// Get the service nodes.
-	rsp, err := cli.Get(context.Background(), r.servicePath(serviceName)+"/", clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortDescend))
+	ctx, cancel := context.WithTimeout(context.Background(), r.defaultTimeout)
+	defer cancel()
+
+	servicePath := r.servicePath(serviceName)
+	logger.WithField("path", servicePath).Debug("Fetching service nodes")
+
+	rsp, err := cli.Get(ctx, servicePath+"/", clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortDescend))
 	if err != nil {
+		logger.WithError(err).Error("Failed to get service nodes")
 		return nil, err
 	}
 
-	// Create a list of nodes.
 	nodes := make([]Node, 0)
 
-	// Check if there are any service nodes.
 	if len(rsp.Kvs) == 0 {
-		logrus.Debugf("No services nodes were found under %s", r.servicePath(serviceName)+"/")
+		logger.Debug("No service nodes found")
 		return nodes, nil
 	}
 
-	// Iterate over the service nodes.
 	for _, n := range rsp.Kvs {
-		// Create a new node.
-		node := Node{}
-		node.Name = strings.TrimPrefix(string(n.Key), r.servicePath(serviceName)+"/")
-		node.Info = decode(n.Value)
+		nodeName := strings.TrimPrefix(string(n.Key), servicePath+"/")
+		nodeInfo := decode(n.Value)
+
+		node := Node{
+			Name: nodeName,
+			Info: nodeInfo,
+		}
 		nodes = append(nodes, node)
+
+		logger.WithFields(logrus.Fields{
+			"node": nodeName,
+			"info": nodeInfo,
+		}).Debug("Found service node")
 	}
 
+	logger.WithField("count", len(nodes)).Info("Successfully retrieved service nodes")
 	return nodes, nil
 }
 
@@ -279,75 +331,71 @@ func (r *EtcdRegistry) GetServiceNodes(serviceName string) ([]Node, error) {
 // It handles both authenticated and non-authenticated connections, and validates
 // the connection is working before returning.
 func (r *EtcdRegistry) initializeETCDClient() (*clientv3.Client, error) {
-	// Validate endpoints
+	logger := r.logger.WithField("operation", "initialize_client")
+
 	if len(r.etcdEndpoints) == 0 {
 		return nil, fmt.Errorf("no etcd endpoints provided")
 	}
 
-	// Create context with timeout for connection
 	ctx, cancel := context.WithTimeout(context.Background(), r.defaultTimeout)
 	defer cancel()
 
-	// Build base config
 	config := clientv3.Config{
 		Endpoints:   r.etcdEndpoints,
 		DialTimeout: r.defaultTimeout,
 		Context:     ctx,
 	}
 
-	// Add authentication only if both username and password are provided
 	if r.etcdUsername != "" && r.etcdPassword != "" {
 		config.Username = r.etcdUsername
 		config.Password = r.etcdPassword
+		logger.Debug("Using authenticated connection")
+	} else {
+		logger.Debug("Using unauthenticated connection")
 	}
 
-	// Initialize client
 	cli, err := clientv3.New(config)
 	if err != nil {
+		logger.WithError(err).Error("Failed to create etcd client")
 		return nil, fmt.Errorf("failed to create etcd client: %w", err)
 	}
 
-	// Ensure connection is cleaned up if subsequent operations fail
 	success := false
 	defer func() {
 		if !success {
-			cli.Close()
+			err := cli.Close()
+			if err != nil {
+				logger.WithError(err).Error("Failed to close etcd client")
+			}
 		}
 	}()
 
-	// Test connection by getting cluster status
 	statusCtx, statusCancel := context.WithTimeout(ctx, r.defaultTimeout)
 	defer statusCancel()
 
 	_, err = cli.Status(statusCtx, r.etcdEndpoints[0])
 	if err != nil {
-		// Special handling for authentication errors
-		if strings.Contains(err.Error(), "authentication is not enabled") {
-			// If server has auth disabled but we provided credentials, retry without auth
-			if r.etcdUsername != "" || r.etcdPassword != "" {
-				logrus.Debug("Authentication is disabled on server, retrying without credentials")
-				r.etcdUsername = ""
-				r.etcdPassword = ""
-				return r.initializeETCDClient()
-			}
+		if strings.Contains(err.Error(), "authentication is not enabled") && (r.etcdUsername != "" || r.etcdPassword != "") {
+			logger.Info("Authentication is disabled on server, retrying without credentials")
+			r.etcdUsername = ""
+			r.etcdPassword = ""
+			return r.initializeETCDClient()
 		}
+		logger.WithError(err).Error("Failed to connect to etcd")
 		return nil, fmt.Errorf("failed to connect to etcd: %w", err)
 	}
 
-	// Verify we can access the base path
 	checkCtx, checkCancel := context.WithTimeout(ctx, r.defaultTimeout)
 	defer checkCancel()
 
-	// Try to read from base path to verify permissions
 	_, err = cli.Get(checkCtx, r.etcdBasePath)
 	if err != nil {
+		logger.WithError(err).Error("Failed to access base path")
 		return nil, fmt.Errorf("failed to access base path '%s': %w", r.etcdBasePath, err)
 	}
 
-	// Connection is good
 	success = true
-	logrus.Debugf("Successfully connected to etcd cluster at %v with base path '%s'",
-		r.etcdEndpoints, r.etcdBasePath)
+	logger.Info("Successfully connected to etcd cluster")
 
 	return cli, nil
 }
@@ -365,7 +413,11 @@ func encode(m map[string]string) string {
 func decode(ds []byte) map[string]string {
 	if ds != nil && len(ds) > 0 {
 		var s map[string]string
-		json.Unmarshal(ds, &s)
+		err := json.Unmarshal(ds, &s)
+		if err != nil {
+			logrus.WithError(err).Error("Failed to decode JSON")
+			return nil
+		}
 		return s
 	}
 	return nil
@@ -373,14 +425,12 @@ func decode(ds []byte) map[string]string {
 
 // servicePath returns the path for a service.
 func (r *EtcdRegistry) servicePath(serviceName string) string {
-	// Replace '/' with '-' in the service name.
 	service := strings.Replace(serviceName, "/", "-", -1)
 	return path.Join(r.etcdBasePath, service)
 }
 
 // nodePath returns the path for a node.
 func (r *EtcdRegistry) nodePath(serviceName string, nodeName string) string {
-	// Replace '/' with '-' in the service name and node name.
 	service := strings.Replace(serviceName, "/", "-", -1)
 	node := strings.Replace(nodeName, "/", "-", -1)
 	return path.Join(r.etcdBasePath, service, node)
