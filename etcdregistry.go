@@ -22,28 +22,14 @@ const (
 	maxBackoffDuration = 2 * time.Minute
 	initialBackoff     = 1 * time.Second
 	backoffFactor      = 2.0
-	connectionCooldown = 30 * time.Second
-	defaultInitTimeout = 2 * time.Minute
-	keepAliveTime      = 10 * time.Second // More frequent keepalives
-	keepAliveTimeout   = 5 * time.Second  // Shorter timeout
-	dialTimeout        = 20 * time.Second // Longer dial timeout
+	keepAliveTimeout   = 5 * time.Second // Shorter timeout
 
 	// Health check parameters
 	healthCheckInterval = 5 * time.Second // More frequent health checks
 	maxFailureCount     = 5               // More failures allowed before reconnect
-	reconnectDelay      = 2 * time.Second // Shorter reconnect delay
-	maxRetryAttempts    = 5               // Max retry attempts for operations
-
-	// GRPC settings
-	grpcBackoffMultiplier = 1.6
-	grpcBackoffMaxDelay   = 120 * time.Second
-	grpcMinConnectTimeout = 20 * time.Second
-
 	// Connection states
 	stateDisconnected = "disconnected"
-	stateConnecting   = "connecting"
 	stateConnected    = "connected"
-	stateError        = "error"
 )
 
 // EtcdRegistry is a library for registering and retrieving service nodes from etcd.
