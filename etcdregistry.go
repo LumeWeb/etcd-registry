@@ -32,6 +32,56 @@ const (
 	stateConnected    = "connected"
 )
 
+// calculateBackoff computes the next backoff duration using exponential backoff
+func calculateBackoff(attempt int) time.Duration {
+	backoff := time.Duration(float64(initialBackoff) * math.Pow(backoffFactor, float64(attempt-1)))
+	if backoff > maxBackoffDuration {
+		backoff = maxBackoffDuration
+	}
+	return backoff
+}
+
+// performWithBackoff executes an operation with exponential backoff retry logic
+func (r *EtcdRegistry) performWithBackoff(ctx context.Context, operation string, maxAttempts int, f func() error) error {
+	var lastErr error
+	
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		r.logger.WithFields(logrus.Fields{
+			"operation": operation,
+			"attempt":   attempt,
+		}).Debug("Attempting operation")
+
+		if err := f(); err == nil {
+			if attempt > 1 {
+				r.logger.WithField("attempts", attempt).Info("Operation succeeded after retries")
+			}
+			return nil
+		} else {
+			lastErr = err
+			if attempt == maxAttempts {
+				break
+			}
+
+			backoff := calculateBackoff(attempt)
+			r.logger.WithFields(logrus.Fields{
+				"operation": operation,
+				"attempt":   attempt,
+				"backoff":   backoff,
+				"error":     err,
+			}).Warn("Operation failed, will retry")
+
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("context cancelled during %s: %w", operation, ctx.Err())
+			case <-time.After(backoff):
+				continue
+			}
+		}
+	}
+
+	return fmt.Errorf("%s failed after %d attempts: %w", operation, maxAttempts, lastErr)
+}
+
 // EtcdRegistry is a library for registering and retrieving service nodes from etcd.
 type EtcdRegistry struct {
 	etcdBasePath   string
@@ -421,24 +471,41 @@ func (r *EtcdRegistry) GetServiceGroups() ([]string, error) {
 
 // connect establishes a new connection to etcd
 func (r *EtcdRegistry) connect() error {
-	config := clientv3.Config{
-		Endpoints:            r.etcdEndpoints,
-		Username:             r.etcdUsername,
-		Password:             r.etcdPassword,
-		DialTimeout:          5 * time.Second,
-		DialKeepAliveTime:    2 * time.Second,
-		DialKeepAliveTimeout: 1 * time.Second,
-		AutoSyncInterval:     1 * time.Minute,
-		PermitWithoutStream:  true,
-	}
+	var client *clientv3.Client
+	
+	return r.performWithBackoff(r.ctx, "connect", 5, func() error {
+		config := clientv3.Config{
+			Endpoints:            r.etcdEndpoints,
+			Username:            r.etcdUsername,
+			Password:            r.etcdPassword,
+			DialTimeout:         30 * time.Second,
+			DialKeepAliveTime:   10 * time.Second,
+			DialKeepAliveTimeout: 5 * time.Second,
+			AutoSyncInterval:    1 * time.Minute,
+			PermitWithoutStream: true,
+		}
 
-	client, err := clientv3.New(config)
-	if err != nil {
-		return fmt.Errorf("failed to create client: %w", err)
-	}
+		var err error
+		client, err = clientv3.New(config)
+		if err != nil {
+			return fmt.Errorf("failed to create client: %w", err)
+		}
 
-	r.client = client
-	return nil
+		// Test the connection with a simple operation
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		
+		_, err = client.Get(ctx, "test-key")
+		if err != nil {
+			client.Close()
+			return fmt.Errorf("connection test failed: %w", err)
+		}
+
+		r.client = client
+		r.connectionState = stateConnected
+		r.logger.Info("Successfully connected to etcd")
+		return nil
+	})
 }
 
 // monitorHealth continuously monitors connection health
@@ -506,39 +573,7 @@ func (r *EtcdRegistry) checkHealth() error {
 
 // reconnect attempts to reestablish the connection with backoff
 func (r *EtcdRegistry) reconnect() error {
-	backoff := initialBackoff
-	maxAttempts := 5
-
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		r.logger.WithField("attempt", attempt).Info("Attempting reconnection")
-
-		if err := r.connect(); err != nil {
-			if attempt == maxAttempts {
-				return fmt.Errorf("failed to reconnect after %d attempts: %w", maxAttempts, err)
-			}
-
-			backoff = time.Duration(float64(initialBackoff) * math.Pow(backoffFactor, float64(attempt-1)))
-			if backoff > maxBackoffDuration {
-				backoff = maxBackoffDuration
-			}
-
-			r.logger.WithFields(logrus.Fields{
-				"attempt": attempt,
-				"backoff": backoff,
-				"error":   err,
-			}).Warn("Reconnection attempt failed")
-
-			select {
-			case <-r.ctx.Done():
-				return fmt.Errorf("context cancelled during reconnection")
-			case <-time.After(backoff):
-				continue
-			}
-		}
-
-		r.logger.Info("Reconnection successful")
-		return nil
-	}
-
-	return fmt.Errorf("reconnection failed after %d attempts", maxAttempts)
+	return r.performWithBackoff(r.ctx, "reconnect", 5, func() error {
+		return r.connect()
+	})
 }
