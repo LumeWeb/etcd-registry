@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"math"
 	"path"
 	"strings"
@@ -24,13 +26,20 @@ const (
 	backoffFactor      = 2.0
 	connectionCooldown = 30 * time.Second
 	defaultInitTimeout = 2 * time.Minute
-	keepAliveTime      = 30 * time.Second
-	keepAliveTimeout   = 10 * time.Second
+	keepAliveTime      = 10 * time.Second // More frequent keepalives
+	keepAliveTimeout   = 5 * time.Second  // Shorter timeout
+	dialTimeout        = 20 * time.Second // Longer dial timeout
 
 	// Health check parameters
-	healthCheckInterval = 15 * time.Second
-	maxFailureCount     = 3
-	reconnectDelay      = 5 * time.Second
+	healthCheckInterval = 5 * time.Second // More frequent health checks
+	maxFailureCount     = 5               // More failures allowed before reconnect
+	reconnectDelay      = 2 * time.Second // Shorter reconnect delay
+	maxRetryAttempts    = 5               // Max retry attempts for operations
+
+	// GRPC settings
+	grpcBackoffMultiplier = 1.6
+	grpcBackoffMaxDelay   = 120 * time.Second
+	grpcMinConnectTimeout = 20 * time.Second
 
 	// Connection states
 	stateDisconnected = "disconnected"
@@ -467,12 +476,35 @@ func (r *EtcdRegistry) connect() error {
 	r.connectionState = stateConnecting
 	r.logger.Info("Establishing connection to etcd")
 
+	// Create connection parameters for stability
+	connParams := grpc.ConnectParams{
+		Backoff: backoff.Config{
+			BaseDelay:  1.0 * time.Second,
+			Multiplier: 1.6,
+			Jitter:     0.2,
+			MaxDelay:   120 * time.Second,
+		},
+		MinConnectTimeout: 20 * time.Second,
+	}
+
+	// Create GRPC options for connection stability
+	grpcOpts := []grpc.DialOption{
+		grpc.WithConnectParams(connParams),
+		grpc.WithReturnConnectionError(),
+		grpc.WithBlock(),
+		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+	}
+
 	config := clientv3.Config{
 		Endpoints:            r.etcdEndpoints,
-		DialTimeout:          r.defaultTimeout,
+		DialTimeout:          dialTimeout,
 		DialKeepAliveTime:    keepAliveTime,
 		DialKeepAliveTimeout: keepAliveTimeout,
+		DialOptions:          grpcOpts,
 		Context:              r.ctx,
+		RejectOldCluster:     true,
+		AutoSyncInterval:     5 * time.Minute,
+		PermitWithoutStream:  true,
 	}
 
 	if r.etcdUsername != "" && r.etcdPassword != "" {
@@ -480,30 +512,56 @@ func (r *EtcdRegistry) connect() error {
 		config.Password = r.etcdPassword
 	}
 
-	client, err := clientv3.New(config)
+	// Create client with retry
+	var client *clientv3.Client
+	var err error
+	for attempt := 0; attempt < maxRetryAttempts; attempt++ {
+		if attempt > 0 {
+			r.logger.WithField("attempt", attempt+1).Info("Retrying connection")
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+
+		client, err = clientv3.New(config)
+		if err == nil {
+			break
+		}
+		r.logger.WithError(err).WithField("attempt", attempt+1).Warn("Connection attempt failed")
+	}
+
 	if err != nil {
 		r.connectionState = stateError
 		r.failureCount++
 		r.lastFailure = time.Now()
-		return fmt.Errorf("failed to create etcd client: %w", err)
+		return fmt.Errorf("failed to create etcd client after %d attempts: %w", maxRetryAttempts, err)
 	}
 
-	// Validate connection
+	// Validate connection with retry
 	ctx, cancel := context.WithTimeout(r.ctx, r.defaultTimeout)
 	defer cancel()
 
-	if _, err := client.Status(ctx, r.etcdEndpoints[0]); err != nil {
-		r.connectionState = stateError
-		r.failureCount++
-		r.lastFailure = time.Now()
-		client.Close()
-		return fmt.Errorf("failed to validate connection: %w", err)
+	for attempt := 0; attempt < maxRetryAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+
+		if _, err := client.Status(ctx, r.etcdEndpoints[0]); err == nil {
+			break
+		} else if attempt == maxRetryAttempts-1 {
+			r.connectionState = stateError
+			r.failureCount++
+			r.lastFailure = time.Now()
+			client.Close()
+			return fmt.Errorf("failed to validate connection after %d attempts: %w", maxRetryAttempts, err)
+		}
 	}
 
 	// Update client reference
 	if r.client != nil {
-		r.client.Close()
+		if err := r.client.Close(); err != nil {
+			r.logger.WithError(err).Warn("Error closing old client")
+		}
 	}
+
 	r.client = client
 	r.connectionState = stateConnected
 	r.failureCount = 0
@@ -516,20 +574,32 @@ func (r *EtcdRegistry) connect() error {
 func (r *EtcdRegistry) monitorHealth() {
 	defer r.wg.Done()
 
+	ticker := time.NewTicker(healthCheckInterval)
+	defer ticker.Stop()
+
+	consecutiveFailures := 0
 	for {
 		select {
 		case <-r.ctx.Done():
 			return
 
-		case <-r.healthTicker.C:
+		case <-ticker.C:
 			if err := r.checkHealth(); err != nil {
-				r.logger.WithError(err).Warn("Health check failed")
+				consecutiveFailures++
+				r.logger.WithError(err).WithField("failures", consecutiveFailures).Warn("Health check failed")
 
-				if r.failureCount >= maxFailureCount {
+				if consecutiveFailures >= maxFailureCount {
 					r.logger.Error("Max failures reached, attempting reconnection")
 					if err := r.reconnect(); err != nil {
 						r.logger.WithError(err).Error("Reconnection failed")
+					} else {
+						consecutiveFailures = 0
 					}
+				}
+			} else {
+				if consecutiveFailures > 0 {
+					r.logger.Info("Health check recovered")
+					consecutiveFailures = 0
 				}
 			}
 		}
@@ -548,24 +618,32 @@ func (r *EtcdRegistry) checkHealth() error {
 	ctx, cancel := context.WithTimeout(r.ctx, keepAliveTimeout)
 	defer cancel()
 
-	_, err := r.client.Status(ctx, r.etcdEndpoints[0])
-	if err != nil {
-		r.failureCount++
-		r.lastFailure = time.Now()
-		return fmt.Errorf("health check failed: %w", err)
+	// Try multiple endpoints if available
+	var lastErr error
+	for _, endpoint := range r.etcdEndpoints {
+		if _, err := r.client.Status(ctx, endpoint); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
 	}
 
-	return nil
+	r.failureCount++
+	r.lastFailure = time.Now()
+	return fmt.Errorf("health check failed on all endpoints: %w", lastErr)
 }
 
 // reconnect attempts to reestablish the connection with backoff
 func (r *EtcdRegistry) reconnect() error {
 	backoff := initialBackoff
+	maxAttempts := 5
 
-	for attempt := 1; ; attempt++ {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		r.logger.WithField("attempt", attempt).Info("Attempting reconnection")
+
 		if err := r.connect(); err != nil {
-			if time.Since(r.lastFailure) < connectionCooldown {
-				time.Sleep(connectionCooldown)
+			if attempt == maxAttempts {
+				return fmt.Errorf("failed to reconnect after %d attempts: %w", maxAttempts, err)
 			}
 
 			backoff = time.Duration(float64(initialBackoff) * math.Pow(backoffFactor, float64(attempt-1)))
@@ -587,6 +665,9 @@ func (r *EtcdRegistry) reconnect() error {
 			}
 		}
 
+		r.logger.Info("Reconnection successful")
 		return nil
 	}
+
+	return fmt.Errorf("reconnection failed after %d attempts", maxAttempts)
 }
