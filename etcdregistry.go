@@ -401,6 +401,8 @@ func (r *EtcdRegistry) nodePath(serviceName string, nodeName string) string {
 func (r *EtcdRegistry) connect() error {
 	config := clientv3.Config{
 		Endpoints:            r.etcdEndpoints,
+		Username:             r.etcdUsername,
+		Password:             r.etcdPassword,
 		DialTimeout:          5 * time.Second,
 		DialKeepAliveTime:    2 * time.Second,
 		DialKeepAliveTimeout: 1 * time.Second,
