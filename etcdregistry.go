@@ -383,6 +383,42 @@ func (r *EtcdRegistry) nodePath(serviceName string, nodeName string) string {
 	return path.Join(r.etcdBasePath, service, node)
 }
 
+// GetServiceGroups returns a list of all service group names under the base path
+func (r *EtcdRegistry) GetServiceGroups() ([]string, error) {
+	if r.client == nil {
+		return nil, fmt.Errorf("client not initialized")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), r.defaultTimeout)
+	defer cancel()
+
+	// Get all keys under base path
+	rsp, err := r.client.Get(ctx, r.etcdBasePath, clientv3.WithPrefix(), clientv3.WithKeysOnly())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get services: %w", err)
+	}
+
+	// Use a map to deduplicate service names
+	serviceMap := make(map[string]struct{})
+
+	// Extract unique service names from paths
+	for _, kv := range rsp.Kvs {
+		relativePath := strings.TrimPrefix(string(kv.Key), r.etcdBasePath+"/")
+		parts := strings.Split(relativePath, "/")
+		if len(parts) > 0 {
+			serviceMap[parts[0]] = struct{}{}
+		}
+	}
+
+	// Convert map keys to slice
+	services := make([]string, 0, len(serviceMap))
+	for service := range serviceMap {
+		services = append(services, service)
+	}
+
+	return services, nil
+}
+
 // connect establishes a new connection to etcd
 func (r *EtcdRegistry) connect() error {
 	config := clientv3.Config{

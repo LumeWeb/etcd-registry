@@ -3,6 +3,7 @@ package etcdregistry
 import (
 	"context"
 	"fmt"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"strings"
 	"sync"
 	"testing"
@@ -332,6 +333,84 @@ func TestFailureCases(t *testing.T) {
 			// Test passed - we got a timeout
 		case <-time.After(5 * time.Second):
 			t.Error("Test did not timeout as expected")
+		}
+	})
+}
+
+func TestGetServiceGroups(t *testing.T) {
+	r, err := NewEtcdRegistry([]string{"localhost:2379"}, "/test", "", "", 10*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to create registry: %v", err)
+	}
+
+	// Test case 1: Empty registry
+	t.Run("Empty Registry", func(t *testing.T) {
+		// Clean up any existing keys
+		ctx := context.Background()
+		_, err := r.client.Delete(ctx, r.etcdBasePath, clientv3.WithPrefix())
+		if err != nil {
+			t.Fatalf("Failed to clean up registry: %v", err)
+		}
+
+		groups, err := r.GetServiceGroups()
+		if err != nil {
+			t.Fatalf("Failed to get service groups: %v", err)
+		}
+		if len(groups) != 0 {
+			t.Errorf("Expected 0 groups, got %d", len(groups))
+		}
+	})
+
+	// Test case 2: Multiple services with nodes
+	t.Run("Multiple Services", func(t *testing.T) {
+		// Register some test nodes
+		ctx := context.Background()
+		services := []string{"service1", "service2", "service3"}
+
+		for _, service := range services {
+			node := Node{
+				Name: "test-node",
+				Info: map[string]string{"key": "value"},
+			}
+			done, errChan, err := r.RegisterNode(ctx, service, node, 10*time.Second)
+			if err != nil {
+				t.Fatalf("Failed to register node for service %s: %v", service, err)
+			}
+
+			select {
+			case <-done:
+				// Success
+			case err := <-errChan:
+				t.Fatalf("Registration failed for service %s: %v", service, err)
+			case <-time.After(5 * time.Second):
+				t.Fatalf("Registration timed out for service %s", service)
+			}
+		}
+
+		// Give etcd time to process registrations
+		time.Sleep(1 * time.Second)
+
+		// Get service groups
+		groups, err := r.GetServiceGroups()
+		if err != nil {
+			t.Fatalf("Failed to get service groups: %v", err)
+		}
+
+		// Verify results
+		if len(groups) != len(services) {
+			t.Errorf("Expected %d groups, got %d", len(services), len(groups))
+		}
+
+		// Check if all expected services are present
+		groupMap := make(map[string]bool)
+		for _, group := range groups {
+			groupMap[group] = true
+		}
+
+		for _, service := range services {
+			if !groupMap[service] {
+				t.Errorf("Expected service %s not found in groups", service)
+			}
 		}
 	})
 }
