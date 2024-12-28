@@ -353,10 +353,37 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 		return fmt.Errorf("failed to start keepalive: %w", err)
 	}
 
-	// Consume keepalive responses in a goroutine to prevent blocking
+	// Monitor keepalive responses in a goroutine
 	go func() {
-		for range keepAlive {
-			// Drain the channel
+		defer func() {
+			r.logger.WithFields(logrus.Fields{
+				"node_id": node.ID,
+				"status":  node.Status,
+			}).Debug("Registration lease expired/completed")
+		}()
+
+		for {
+			select {
+			case ka, ok := <-keepAlive:
+				if !ok {
+					// Channel closed - lease expired or connection lost
+					return
+				}
+				if ka == nil {
+					// Keepalive failed
+					return
+				}
+				// Successful keepalive response
+				r.logger.WithFields(logrus.Fields{
+					"node_id":      node.ID,
+					"status":       node.Status,
+					"lease_id":     ka.ID,
+					"ttl":          ka.TTL,
+				}).Debug("Keepalive successful")
+			case <-ctx.Done():
+				// Context cancelled
+				return
+			}
 		}
 	}()
 

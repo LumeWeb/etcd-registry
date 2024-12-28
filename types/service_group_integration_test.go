@@ -1,8 +1,12 @@
 //go:build integration
+
 package types
 
 import (
 	"context"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.uber.org/mock/gomock"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -59,10 +63,35 @@ func TestServiceGroup_Integration(t *testing.T) {
 				},
 			}
 
+			// Set up mock expectations in correct order
+			mock.EXPECT().ServicePath("test-group").Return("/test/test-group/nodes").AnyTimes()
+
+			// First expect the node registrations with flexible matching
+			for _, node := range testNodes {
+				mock.EXPECT().RegisterNodeWithRetry(
+					gomock.Any(),
+					"test-group",
+					gomock.AssignableToTypeOf(Node{}), // Allow any Node value
+					10*time.Second,
+					gomock.Any(),
+					gomock.Any(),
+				).Do(func(_ context.Context, _ string, actualNode Node, _ time.Duration, done chan<- struct{}, _ chan error) {
+					// Verify the important fields match while ignoring Status and LastSeen
+					if actualNode.ID != node.ID ||
+						actualNode.ExporterType != node.ExporterType ||
+						actualNode.Port != node.Port ||
+						actualNode.MetricsPath != node.MetricsPath {
+						t.Errorf("Node mismatch: want %+v, got %+v", node, actualNode)
+					}
+					close(done) // Simulate successful registration
+				})
+			}
+
+			// Register the nodes
 			for _, node := range testNodes {
 				done, errChan, err := sg.RegisterNode(context.Background(), node, 10*time.Second)
 				if err != nil {
-					t.Fatalf("Failed to register test node: %v", err)
+					t.Fatalf("Failed to register node: %v", err)
 				}
 				select {
 				case <-done:
@@ -74,6 +103,8 @@ func TestServiceGroup_Integration(t *testing.T) {
 				}
 			}
 
+			// Then expect and perform the GetNodes call
+			mock.EXPECT().GetNodes(gomock.Any(), "/test/test-group/nodes").Return(testNodes, nil)
 			nodes, err := sg.GetNodes(context.Background())
 			if err != nil {
 				t.Fatalf("GetNodes failed: %v", err)
