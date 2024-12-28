@@ -30,9 +30,6 @@ type Registry interface {
 
 // Configure updates the group's configuration both locally and in etcd
 func (g *ServiceGroup) Configure(spec ServiceGroupSpec) error {
-	if spec.Password != "" && spec.Username == "" {
-		return fmt.Errorf("username required when password is set")
-	}
 
 	// Validate CommonLabels
 	if spec.CommonLabels != nil {
