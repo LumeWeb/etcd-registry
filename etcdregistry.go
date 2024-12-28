@@ -10,6 +10,7 @@ import (
 	"go.lumeweb.com/etcd-registry/types"
 	"math"
 	"path"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -92,7 +93,7 @@ func (r *EtcdRegistry) performWithBackoff(ctx context.Context, operation string,
 				select {
 				case <-ctx.Done():
 					timer.Stop()
-					return fmt.Errorf("context cancelled during %s backoff: %w (last error: %v)", 
+					return fmt.Errorf("context cancelled during %s backoff: %w (last error: %v)",
 						operation, ctx.Err(), lastErr)
 				case <-timer.C:
 					continue
@@ -308,7 +309,7 @@ func (r *EtcdRegistry) RegisterNodeWithRetry(ctx context.Context, groupName stri
 				logger.Info("Initial registration successful")
 				backoff = initialBackoff
 				attempts = 0
-				
+
 			}
 
 			// Simple wait before retry
@@ -594,8 +595,8 @@ func (r *EtcdRegistry) getClientConfig() clientv3.Config {
 		DialKeepAliveTimeout: r.defaultTimeout / 2,
 		AutoSyncInterval:     5 * time.Minute,
 		PermitWithoutStream:  true,
-		MaxCallSendMsgSize:   0,     // Use default
-		MaxCallRecvMsgSize:   0,     // Use default
+		MaxCallSendMsgSize:   0, // Use default
+		MaxCallRecvMsgSize:   0, // Use default
 	}
 }
 
@@ -793,6 +794,19 @@ func (r *EtcdRegistry) GetClient() *clientv3.Client {
 	return r.client
 }
 
+// nodesEqualExceptLastSeen compares two nodes ignoring the LastSeen field
+func nodesEqualExceptLastSeen(a, b types.Node) bool {
+	// Create copies to avoid modifying original nodes
+	aCopy := a
+	bCopy := b
+
+	// Zero out LastSeen fields
+	aCopy.LastSeen = time.Time{}
+	bCopy.LastSeen = time.Time{}
+
+	return reflect.DeepEqual(aCopy, bCopy)
+}
+
 // WatchServices watches for all service and node changes
 func (r *EtcdRegistry) WatchServices(ctx context.Context) (<-chan types.WatchEvent, error) {
 	if r.client == nil {
@@ -970,22 +984,37 @@ func (r *EtcdRegistry) WatchGroupNodes(ctx context.Context, groupName string) (<
 						eventType = types.EventTypeDelete
 					}
 
-					var node types.Node
 					if event.Type != clientv3.EventTypeDelete {
-						if err := json.Unmarshal(event.Kv.Value, &node); err != nil {
+						var newNode types.Node
+						if err := json.Unmarshal(event.Kv.Value, &newNode); err != nil {
 							r.logger.WithError(err).Error("Failed to unmarshal node data")
 							continue
 						}
-					}
 
-					select {
-					case eventChan <- types.WatchEvent{
-						Type:      eventType,
-						GroupName: groupName,
-						Node:      &node,
-					}:
-					case <-ctx.Done():
-						return
+						// For updates, check if only LastSeen changed
+						if eventType == types.EventTypeUpdate && event.PrevKv != nil {
+							var oldNode types.Node
+							if err := json.Unmarshal(event.PrevKv.Value, &oldNode); err != nil {
+								r.logger.WithError(err).Error("Failed to unmarshal previous node data")
+								continue
+							}
+
+							// Compare nodes ignoring LastSeen field
+							if nodesEqualExceptLastSeen(oldNode, newNode) {
+								r.logger.WithField("node", newNode.ID).Debug("Ignoring update event - only LastSeen changed")
+								continue
+							}
+						}
+
+						select {
+						case eventChan <- types.WatchEvent{
+							Type:      eventType,
+							GroupName: groupName,
+							Node:      &newNode,
+						}:
+						case <-ctx.Done():
+							return
+						}
 					}
 				}
 			}
