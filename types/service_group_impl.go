@@ -26,6 +26,9 @@ type Registry interface {
 	GetNodes(ctx context.Context, groupPath string) ([]Node, error)
 	GetClient() *clientv3.Client
 	GetEtcdBasePath() string
+	WatchServices(ctx context.Context) (<-chan WatchEvent, error)
+	WatchGroup(ctx context.Context, groupName string) (<-chan WatchEvent, error)
+	WatchGroupNodes(ctx context.Context, groupName string) (<-chan WatchEvent, error)
 }
 
 // Configure updates the group's configuration both locally and in etcd

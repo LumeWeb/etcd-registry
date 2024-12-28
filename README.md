@@ -126,6 +126,49 @@ for _, node := range nodes {
 }
 ```
 
+### Watch API
+
+The library provides three watch methods for monitoring changes:
+
+```go
+// Watch all services and nodes
+events, err := registry.WatchServices(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+
+// Watch a specific service group
+events, err := registry.WatchGroup(ctx, "my-service")
+if err != nil {
+    log.Fatal(err)
+}
+
+// Watch nodes in a specific group
+events, err := registry.WatchGroupNodes(ctx, "my-service")
+if err != nil {
+    log.Fatal(err)
+}
+
+// Handle events
+for event := range events {
+    switch event.Type {
+    case types.EventTypeCreate:
+        fmt.Printf("Created: group=%s node=%v\n", event.GroupName, event.Node)
+    case types.EventTypeUpdate:
+        fmt.Printf("Updated: group=%s node=%v\n", event.GroupName, event.Node)
+    case types.EventTypeDelete:
+        fmt.Printf("Deleted: group=%s node=%v\n", event.GroupName, event.Node)
+    }
+}
+```
+
+Each watch method returns a channel that receives `WatchEvent` structs containing:
+- Type: The event type (create/update/delete)
+- GroupName: The name of the affected service group
+- Node: The affected node (if applicable)
+
+The watch will continue until the context is cancelled or an error occurs.
+
 ## Configuration
 
 ### Registry Configuration

@@ -793,6 +793,208 @@ func (r *EtcdRegistry) GetClient() *clientv3.Client {
 	return r.client
 }
 
+// WatchServices watches for all service and node changes
+func (r *EtcdRegistry) WatchServices(ctx context.Context) (<-chan types.WatchEvent, error) {
+	if r.client == nil {
+		return nil, fmt.Errorf("etcd client connection unavailable")
+	}
+
+	eventChan := make(chan types.WatchEvent)
+
+	go func() {
+		defer close(eventChan)
+
+		watcher := r.client.Watch(ctx, r.etcdBasePath, clientv3.WithPrefix())
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+
+			case watchResponse := <-watcher:
+				if watchResponse.Err() != nil {
+					r.logger.WithError(watchResponse.Err()).Error("Watch error occurred")
+					return
+				}
+
+				for _, event := range watchResponse.Events {
+					key := string(event.Kv.Key)
+					relativePath := strings.TrimPrefix(key, r.etcdBasePath+"/")
+					parts := strings.Split(relativePath, "/")
+
+					if len(parts) < 2 {
+						continue
+					}
+
+					groupName := parts[0]
+					var eventType types.WatchEventType
+
+					switch event.Type {
+					case clientv3.EventTypePut:
+						if event.IsCreate() {
+							eventType = types.EventTypeCreate
+						} else {
+							eventType = types.EventTypeUpdate
+						}
+					case clientv3.EventTypeDelete:
+						eventType = types.EventTypeDelete
+					}
+
+					if len(parts) > 2 && parts[1] == "nodes" {
+						var node types.Node
+						if event.Type != clientv3.EventTypeDelete {
+							if err := json.Unmarshal(event.Kv.Value, &node); err != nil {
+								r.logger.WithError(err).Error("Failed to unmarshal node data")
+								continue
+							}
+						}
+
+						select {
+						case eventChan <- types.WatchEvent{
+							Type:      eventType,
+							GroupName: groupName,
+							Node:      &node,
+						}:
+						case <-ctx.Done():
+							return
+						}
+					} else {
+						select {
+						case eventChan <- types.WatchEvent{
+							Type:      eventType,
+							GroupName: groupName,
+						}:
+						case <-ctx.Done():
+							return
+						}
+					}
+				}
+			}
+		}
+	}()
+
+	return eventChan, nil
+}
+
+// WatchGroup watches for changes in a specific service group
+func (r *EtcdRegistry) WatchGroup(ctx context.Context, groupName string) (<-chan types.WatchEvent, error) {
+	if r.client == nil {
+		return nil, fmt.Errorf("etcd client connection unavailable")
+	}
+
+	groupPath := path.Join(r.etcdBasePath, groupName)
+	eventChan := make(chan types.WatchEvent)
+
+	go func() {
+		defer close(eventChan)
+
+		watcher := r.client.Watch(ctx, groupPath, clientv3.WithPrefix())
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+
+			case watchResponse := <-watcher:
+				if watchResponse.Err() != nil {
+					r.logger.WithError(watchResponse.Err()).Error("Watch error occurred")
+					return
+				}
+
+				for _, event := range watchResponse.Events {
+					var eventType types.WatchEventType
+
+					switch event.Type {
+					case clientv3.EventTypePut:
+						if event.IsCreate() {
+							eventType = types.EventTypeCreate
+						} else {
+							eventType = types.EventTypeUpdate
+						}
+					case clientv3.EventTypeDelete:
+						eventType = types.EventTypeDelete
+					}
+
+					select {
+					case eventChan <- types.WatchEvent{
+						Type:      eventType,
+						GroupName: groupName,
+					}:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	return eventChan, nil
+}
+
+// WatchGroupNodes watches for node changes in a specific service group
+func (r *EtcdRegistry) WatchGroupNodes(ctx context.Context, groupName string) (<-chan types.WatchEvent, error) {
+	if r.client == nil {
+		return nil, fmt.Errorf("etcd client connection unavailable")
+	}
+
+	nodesPath := r.ServicePath(groupName)
+	eventChan := make(chan types.WatchEvent)
+
+	go func() {
+		defer close(eventChan)
+
+		watcher := r.client.Watch(ctx, nodesPath, clientv3.WithPrefix())
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+
+			case watchResponse := <-watcher:
+				if watchResponse.Err() != nil {
+					r.logger.WithError(watchResponse.Err()).Error("Watch error occurred")
+					return
+				}
+
+				for _, event := range watchResponse.Events {
+					var eventType types.WatchEventType
+
+					switch event.Type {
+					case clientv3.EventTypePut:
+						if event.IsCreate() {
+							eventType = types.EventTypeCreate
+						} else {
+							eventType = types.EventTypeUpdate
+						}
+					case clientv3.EventTypeDelete:
+						eventType = types.EventTypeDelete
+					}
+
+					var node types.Node
+					if event.Type != clientv3.EventTypeDelete {
+						if err := json.Unmarshal(event.Kv.Value, &node); err != nil {
+							r.logger.WithError(err).Error("Failed to unmarshal node data")
+							continue
+						}
+					}
+
+					select {
+					case eventChan <- types.WatchEvent{
+						Type:      eventType,
+						GroupName: groupName,
+						Node:      &node,
+					}:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	return eventChan, nil
+}
+
 // GetEtcdBasePath returns the base path for etcd operations
 func (r *EtcdRegistry) GetEtcdBasePath() string {
 	return r.etcdBasePath
@@ -804,36 +1006,50 @@ func (r *EtcdRegistry) DeleteNode(ctx context.Context, groupName string, node ty
 		return fmt.Errorf("etcd client connection unavailable")
 	}
 
+	// Create a separate context with timeout for the delete operation
+	deleteCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	nodePath := r.NodePath(groupName, node)
-	resp, err := r.client.Delete(ctx, nodePath)
+	resp, err := r.client.Delete(deleteCtx, nodePath)
 	if err != nil {
 		return fmt.Errorf("failed to delete node: %w", err)
 	}
 
-	// Verify deletion was successful
+	// If no keys were deleted, the node was already gone - that's okay
 	if resp.Deleted == 0 {
-		return fmt.Errorf("node not found at path: %s", nodePath)
-	}
-
-	// Check if group is empty and clean it up if needed
-	group, err := r.GetServiceGroup(ctx, groupName)
-	if err != nil {
-		r.logger.WithError(err).WithField("group", groupName).Warn("Failed to get group after deletion")
+		r.logger.WithField("path", nodePath).Debug("Node already deleted")
 		return nil
 	}
 
-	nodes, err := group.GetNodes(ctx)
-	if err != nil {
-		r.logger.WithError(err).WithField("group", groupName).Warn("Failed to check group nodes after deletion")
+	// Skip group cleanup if original context is cancelled
+	select {
+	case <-ctx.Done():
 		return nil
-	}
+	default:
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
 
-	if len(nodes) == 0 {
-		groupPath := path.Join(r.etcdBasePath, groupName)
-		if _, err := r.client.Delete(ctx, groupPath, clientv3.WithPrefix()); err != nil {
-			r.logger.WithError(err).WithField("group", groupName).Warn("Failed to cleanup empty group")
-		} else {
-			r.logger.WithField("group", groupName).Info("Cleaned up empty group")
+		// Best-effort group cleanup
+		group, err := r.GetServiceGroup(cleanupCtx, groupName)
+		if err != nil {
+			r.logger.WithError(err).WithField("group", groupName).Debug("Skipping group cleanup")
+			return nil
+		}
+
+		nodes, err := group.GetNodes(cleanupCtx)
+		if err != nil {
+			r.logger.WithError(err).WithField("group", groupName).Debug("Skipping group cleanup")
+			return nil
+		}
+
+		if len(nodes) == 0 {
+			groupPath := path.Join(r.etcdBasePath, groupName)
+			if _, err := r.client.Delete(cleanupCtx, groupPath, clientv3.WithPrefix()); err != nil {
+				r.logger.WithError(err).WithField("group", groupName).Debug("Failed to cleanup empty group")
+			} else {
+				r.logger.WithField("group", groupName).Debug("Cleaned up empty group")
+			}
 		}
 	}
 
