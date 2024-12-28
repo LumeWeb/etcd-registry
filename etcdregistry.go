@@ -308,15 +308,14 @@ func (r *EtcdRegistry) RegisterNodeWithRetry(ctx context.Context, groupName stri
 				logger.Info("Initial registration successful")
 				backoff = initialBackoff
 				attempts = 0
+				
 			}
 
-			refreshInterval := ttl / 2
-			logger.WithField("refresh_interval", refreshInterval).Debug("Waiting before next registration attempt")
-
+			// Simple wait before retry
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(refreshInterval):
+			case <-time.After(ttl / 2):
 				continue
 			}
 		}
@@ -330,7 +329,7 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 	}
 
 	// Create lease with timeout context
-	lease, err := r.client.Grant(ctx, int64(ttl.Seconds()))
+	leaseResp, err := r.client.Grant(ctx, int64(ttl.Seconds()))
 	if err != nil {
 		return fmt.Errorf("failed to grant lease: %w", err)
 	}
@@ -342,13 +341,13 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 		return fmt.Errorf("failed to marshal node data: %w", err)
 	}
 
-	_, err = r.client.Put(ctx, nodePath, string(nodeData), clientv3.WithLease(lease.ID))
+	_, err = r.client.Put(ctx, nodePath, string(nodeData), clientv3.WithLease(leaseResp.ID))
 	if err != nil {
 		return fmt.Errorf("failed to put node data: %w", err)
 	}
 
 	// Start keepalive with parent context (not timeout context)
-	keepAlive, err := r.client.KeepAlive(ctx, lease.ID)
+	keepAlive, err := r.client.KeepAlive(ctx, leaseResp.ID)
 	if err != nil {
 		return fmt.Errorf("failed to start keepalive: %w", err)
 	}
@@ -356,10 +355,9 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 	// Monitor keepalive responses in a goroutine
 	go func() {
 		defer func() {
-			r.logger.WithFields(logrus.Fields{
-				"node_id": node.ID,
-				"status":  node.Status,
-			}).Debug("Registration lease expired/completed")
+			if err := r.DeleteNode(ctx, serviceName, node); err != nil {
+				r.logger.WithError(err).Error("Failed to cleanup node")
+			}
 		}()
 
 		for {
@@ -367,21 +365,18 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 			case ka, ok := <-keepAlive:
 				if !ok {
 					// Channel closed - lease expired or connection lost
+					r.logger.WithField("node_id", node.ID).Info("Keepalive channel closed")
 					return
 				}
-				if ka == nil {
-					// Keepalive failed
-					return
+				if ka != nil {
+					r.logger.WithFields(logrus.Fields{
+						"node_id":  node.ID,
+						"lease_id": ka.ID,
+						"ttl":      ka.TTL,
+					}).Debug("Keepalive successful")
 				}
-				// Successful keepalive response
-				r.logger.WithFields(logrus.Fields{
-					"node_id":      node.ID,
-					"status":       node.Status,
-					"lease_id":     ka.ID,
-					"ttl":          ka.TTL,
-				}).Debug("Keepalive successful")
 			case <-ctx.Done():
-				// Context cancelled
+				r.logger.WithField("node_id", node.ID).Info("Registration context cancelled")
 				return
 			}
 		}

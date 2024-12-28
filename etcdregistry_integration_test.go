@@ -192,7 +192,79 @@ func TestLeaseKeepalive(t *testing.T) {
 	}
 
 	ttl := 10 * time.Second
-	done, errChan, err := group.RegisterNode(ctx, testNode, ttl)
+	regCtx, regCancel := context.WithCancel(ctx)
+	defer regCancel()
+	
+	done, errChan, err := group.RegisterNode(regCtx, testNode, ttl)
+	if err != nil {
+		t.Fatalf("Failed to register node: %v", err)
+	}
+
+	// Wait for initial registration
+	select {
+	case <-done:
+		// Success
+	case err := <-errChan:
+		t.Fatalf("Registration failed: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Registration timed out")
+	}
+
+	// Monitor error channel for unexpected errors
+	go func() {
+		for err := range errChan {
+			t.Errorf("Unexpected error during registration: %v", err)
+		}
+	}()
+
+	// Verify node exists initially
+	nodes, err := group.GetNodes(ctx)
+	if err != nil {
+		t.Fatalf("Failed to get nodes: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("Expected 1 node, got %d", len(nodes))
+	}
+
+	// Wait longer than the original TTL
+	time.Sleep(ttl + 2*time.Second)
+
+	// Verify node still exists due to keepalive
+	nodes, err = group.GetNodes(ctx)
+	if err != nil {
+		t.Fatalf("Failed to get nodes after TTL: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Errorf("Expected node to still exist due to keepalive, got %d nodes", len(nodes))
+	}
+}
+
+func TestLeaseExpirationLogging(t *testing.T) {
+	r, ctx, cleanup := setupTest(t)
+	defer cleanup()
+
+	// Create a test group
+	group, err := r.CreateOrJoinServiceGroup(ctx, "lease-test-group")
+	if err != nil {
+		t.Fatalf("Failed to create test group: %v", err)
+	}
+
+	// Create a test node with a longer TTL to ensure we can observe the behavior
+	testNode := types.Node{
+		ID:           "lease-test-node",
+		ExporterType: "test_exporter",
+		Port:         9100,
+		MetricsPath:  "/metrics",
+		Labels:       map[string]string{"test": "lease"},
+	}
+
+	ttl := 5 * time.Second
+	
+	// Create cancellable context for registration
+	regCtx, regCancel := context.WithCancel(ctx)
+	defer regCancel()
+
+	done, errChan, err := group.RegisterNode(regCtx, testNode, ttl)
 	if err != nil {
 		t.Fatalf("Failed to register node: %v", err)
 	}
@@ -216,16 +288,29 @@ func TestLeaseKeepalive(t *testing.T) {
 		t.Fatalf("Expected 1 node, got %d", len(nodes))
 	}
 
-	// Wait longer than the original TTL
+	// Wait for a short period - node should still exist
+	time.Sleep(2 * time.Second)
+
+	// Verify node still exists before TTL expiration
+	nodes, err = group.GetNodes(ctx)
+	if err != nil {
+		t.Fatalf("Failed to get nodes before TTL: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Errorf("Expected node to exist before TTL expiration, got %d nodes", len(nodes))
+	}
+
+	// Cancel registration and wait for TTL to expire
+	regCancel()
 	time.Sleep(ttl + 2*time.Second)
 
-	// Verify node still exists due to keepalive
+	// Verify node has been removed after TTL expiration
 	nodes, err = group.GetNodes(ctx)
 	if err != nil {
 		t.Fatalf("Failed to get nodes after TTL: %v", err)
 	}
-	if len(nodes) != 1 {
-		t.Errorf("Expected node to still exist due to keepalive, got %d nodes", len(nodes))
+	if len(nodes) != 0 {
+		t.Errorf("Expected 0 nodes after TTL expiration, got %d", len(nodes))
 	}
 }
 
