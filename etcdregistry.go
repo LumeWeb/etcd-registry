@@ -18,6 +18,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"go.etcd.io/etcd/client/v3"
 	_ "go.lumeweb.com/etcd-registry/types"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -132,6 +133,9 @@ type EtcdRegistry struct {
 
 	// Health monitoring
 	healthTicker *time.Ticker
+
+	// Rate limiting
+	leaseCleanupLimiter *rate.Limiter
 }
 
 // NewEtcdRegistry creates a new EtcdRegistry instance.
@@ -170,13 +174,14 @@ func NewEtcdRegistry(etcdEndpoints []string, etcdBasePath string, etcdUsername s
 			"basePath":  etcdBasePath,
 			"endpoints": strings.Join(etcdEndpoints, ","),
 		}),
-		defaultTimeout:  defaultTimeout,
-		etcdBasePath:    etcdBasePath,
-		etcdEndpoints:   etcdEndpoints,
-		etcdUsername:    etcdUsername,
-		etcdPassword:    etcdPassword,
-		maxRetries:      maxRetries,
-		connectionState: stateDisconnected,
+		defaultTimeout:      defaultTimeout,
+		etcdBasePath:        etcdBasePath,
+		etcdEndpoints:       etcdEndpoints,
+		etcdUsername:        etcdUsername,
+		etcdPassword:        etcdPassword,
+		maxRetries:          maxRetries,
+		connectionState:     stateDisconnected,
+		leaseCleanupLimiter: rate.NewLimiter(rate.Every(100*time.Millisecond), 1), // Max 10 ops/sec
 	}
 
 	// Try to connect first, before creating any goroutines or resources
@@ -205,15 +210,19 @@ func (r *EtcdRegistry) Close() error {
 	// Wait for all goroutines to finish
 	r.wg.Wait()
 
-	// Clean up any lingering leases
+	// Clean up any lingering leases with rate limiting
 	if r.client != nil {
 		ctx := context.Background()
 
 		// Best effort cleanup - don't fail if this errors
 		if leases, err := r.client.Lease.Leases(ctx); err == nil {
 			for _, lease := range leases.Leases {
+				if err := r.leaseCleanupLimiter.Wait(ctx); err != nil {
+					r.logger.WithError(err).Warn("Rate limit exceeded during lease cleanup")
+					continue
+				}
 				_, err := r.client.Lease.Revoke(ctx, lease.ID)
-				if err != nil {
+				if err != nil && !strings.Contains(err.Error(), "lease not found") {
 					r.logger.WithError(err).Error("Failed to revoke lease")
 				}
 			}
@@ -329,6 +338,17 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 		return fmt.Errorf("etcd client connection unavailable")
 	}
 
+	// Check for and cleanup any existing lease for this node
+	nodePath := r.NodePath(serviceName, node)
+	resp, err := r.client.Get(ctx, nodePath)
+	if err == nil && len(resp.Kvs) > 0 {
+		if lease := resp.Kvs[0].Lease; lease != 0 {
+			if err := r.leaseCleanupLimiter.Wait(ctx); err == nil {
+				_, _ = r.client.Lease.Revoke(ctx, clientv3.LeaseID(lease))
+			}
+		}
+	}
+
 	// Create lease with timeout context
 	leaseResp, err := r.client.Grant(ctx, int64(ttl.Seconds()))
 	if err != nil {
@@ -336,7 +356,7 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 	}
 
 	// Put with lease using timeout context
-	nodePath := r.NodePath(serviceName, node)
+	nodePath = r.NodePath(serviceName, node)
 	nodeData, err := json.Marshal(node)
 	if err != nil {
 		return fmt.Errorf("failed to marshal node data: %w", err)

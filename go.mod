@@ -6,6 +6,7 @@ require (
 	github.com/sirupsen/logrus v1.9.3
 	go.etcd.io/etcd/client/v3 v3.5.17
 	go.uber.org/mock v0.5.0
+	golang.org/x/time v0.8.0
 )
 
 require (
