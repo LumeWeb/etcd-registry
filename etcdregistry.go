@@ -145,6 +145,10 @@ type EtcdRegistry struct {
 	maxRetries     int
 	logger         *logrus.Entry
 
+	// Track working endpoints
+	workingEndpoints   []string
+	workingEndpointMu sync.RWMutex
+
 	// Lease management
 	leaseCache   map[string]*leaseInfo // key -> lease info
 	leaseCacheMu sync.RWMutex
@@ -318,8 +322,16 @@ func (r *EtcdRegistry) RegisterNodeWithRetry(ctx context.Context, groupName stri
 	var registered bool
 	backoff := initialBackoff
 	attempts := 0
+	var currentLease clientv3.LeaseID
 
 	cleanup := func() {
+		if currentLease != 0 {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := r.leaseCleanupLimiter.Wait(cleanupCtx); err == nil {
+				_, _ = r.client.Lease.Revoke(cleanupCtx, currentLease)
+			}
+		}
 		if err := r.DeleteNode(ctx, groupName, node); err != nil {
 			logger.WithError(err).Error("Failed to cleanup node on shutdown")
 			select {
@@ -412,8 +424,8 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 
 	if exists && time.Now().Before(existingLease.expiresAt) {
 		// Verify lease is still valid
-		_, err := r.client.TimeToLive(ctx, existingLease.id)
-		if err == nil {
+		ttlResp, err := r.client.TimeToLive(ctx, existingLease.id)
+		if err == nil && ttlResp.TTL > 0 {
 			// Reuse existing lease
 			nodeData, err := json.Marshal(node)
 			if err != nil {
@@ -422,6 +434,10 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 
 			_, err = r.client.Put(ctx, nodePath, string(nodeData), clientv3.WithLease(existingLease.id))
 			if err == nil {
+				r.logger.WithFields(logrus.Fields{
+					"node":     node.ID,
+					"leaseID": existingLease.id,
+				}).Debug("Reusing existing lease")
 				return nil
 			}
 		}
@@ -432,7 +448,6 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 	}
 
 	// Check for and cleanup any existing lease for this node
-	nodePath = r.NodePath(serviceName, node)
 	resp, err := r.client.Get(ctx, nodePath)
 	if err == nil && len(resp.Kvs) > 0 {
 		if lease := resp.Kvs[0].Lease; lease != 0 {
@@ -442,9 +457,9 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 		}
 	}
 
-	// Rate limit lease creation
+	// Rate limit new lease creation
 	if err := r.leaseCleanupLimiter.Wait(ctx); err != nil {
-		return fmt.Errorf("lease operation rate limit exceeded: %w", err)
+		return fmt.Errorf("lease creation rate limit exceeded: %w", err)
 	}
 
 	// Create new lease
@@ -466,7 +481,6 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 	r.leaseCacheMu.Unlock()
 
 	// Put with lease using timeout context
-	nodePath = r.NodePath(serviceName, node)
 	nodeData, err := json.Marshal(node)
 	if err != nil {
 		return fmt.Errorf("failed to marshal node data: %w", err)
@@ -474,14 +488,27 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 
 	_, err = r.client.Put(ctx, nodePath, string(nodeData), clientv3.WithLease(leaseResp.ID))
 	if err != nil {
+		// Cleanup lease on failed put
+		if cleanupErr := r.leaseCleanupLimiter.Wait(ctx); cleanupErr == nil {
+			_, _ = r.client.Lease.Revoke(ctx, leaseResp.ID)
+		}
 		return fmt.Errorf("failed to put node data: %w", err)
 	}
 
-	// Start keepalive with parent context (not timeout context)
+	// Start keepalive with parent context
 	keepAlive, err := r.client.KeepAlive(ctx, leaseResp.ID)
 	if err != nil {
+		// Cleanup lease on failed keepalive
+		if cleanupErr := r.leaseCleanupLimiter.Wait(ctx); cleanupErr == nil {
+			_, _ = r.client.Lease.Revoke(ctx, leaseResp.ID)
+		}
 		return fmt.Errorf("failed to start keepalive: %w", err)
 	}
+
+	r.logger.WithFields(logrus.Fields{
+		"node":     node.ID,
+		"leaseID": leaseResp.ID,
+	}).Debug("Created new lease")
 
 	// Monitor keepalive responses in a goroutine
 	go func() {
@@ -905,15 +932,41 @@ func (r *EtcdRegistry) checkHealth() error {
 	ctx, cancel := context.WithTimeout(r.ctx, 5*time.Second)
 	defer cancel()
 
-	// Try multiple endpoints if available
-	var lastErr error
-	for _, endpoint := range r.etcdEndpoints {
+	// First try known working endpoints
+	r.workingEndpointMu.RLock()
+	workingEndpoints := make([]string, len(r.workingEndpoints))
+	copy(workingEndpoints, r.workingEndpoints)
+	r.workingEndpointMu.RUnlock()
+
+	// Try working endpoints first
+	for _, endpoint := range workingEndpoints {
 		if _, err := r.client.Status(ctx, endpoint); err == nil {
-			// Update state on success
 			r.failureCount = 0
 			r.lastFailure = time.Time{}
 			r.connectionState = stateConnected
-			logger.WithField("endpoint", endpoint).Debug("Health check succeeded")
+			logger.WithField("endpoint", endpoint).Debug("Health check succeeded on known endpoint")
+			return nil
+		}
+	}
+
+	// If no working endpoints, try all endpoints
+	var lastErr error
+	newWorkingEndpoints := make([]string, 0)
+	
+	for _, endpoint := range r.etcdEndpoints {
+		if _, err := r.client.Status(ctx, endpoint); err == nil {
+			// Found a working endpoint
+			newWorkingEndpoints = append(newWorkingEndpoints, endpoint)
+			r.failureCount = 0
+			r.lastFailure = time.Time{}
+			r.connectionState = stateConnected
+			
+			// Update working endpoints
+			r.workingEndpointMu.Lock()
+			r.workingEndpoints = newWorkingEndpoints
+			r.workingEndpointMu.Unlock()
+			
+			logger.WithField("endpoint", endpoint).Debug("Health check succeeded on new endpoint")
 			return nil
 		} else {
 			lastErr = err
@@ -928,6 +981,11 @@ func (r *EtcdRegistry) checkHealth() error {
 	r.failureCount++
 	r.lastFailure = time.Now()
 	r.connectionState = stateDisconnected
+
+	// Clear working endpoints on total failure
+	r.workingEndpointMu.Lock()
+	r.workingEndpoints = nil
+	r.workingEndpointMu.Unlock()
 
 	logger.WithError(lastErr).Debug("Health check failed on all endpoints")
 	return fmt.Errorf("health check failed on all endpoints: %w", lastErr)
