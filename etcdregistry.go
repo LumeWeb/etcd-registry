@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"go.lumeweb.com/etcd-registry/types"
 	"math"
+	"math/rand"
 	"path"
 	"reflect"
 	"strings"
@@ -27,9 +28,18 @@ const (
 	initialBackoff     = 1 * time.Second
 	backoffFactor      = 2.0
 
-	// Health check parameters
-	healthCheckInterval = 5 * time.Second // More frequent health checks
-	maxFailureCount     = 5               // More failures allowed before reconnect
+	// Health check parameters with increased intervals and jitter
+	healthCheckInterval  = 180 * time.Second // Increased to 3 minutes
+	healthCheckJitterMax = 30 * time.Second  // Max jitter for health checks
+	maxFailureCount      = 5                 // Failures before reconnect
+
+	// Circuit breaker settings
+	circuitBreakerThreshold = 10               // Number of failures before opening circuit
+	circuitBreakerTimeout   = 30 * time.Second // How long to keep circuit open
+
+	// Lease management
+	maxLeaseOperationsPerSecond = 5               // Rate limit for lease operations
+	leaseReuseWindow            = 5 * time.Minute // How long to reuse existing leases
 	// Connection states
 	stateDisconnected = "disconnected"
 	stateConnected    = "connected"
@@ -110,6 +120,22 @@ func (r *EtcdRegistry) performWithBackoff(ctx context.Context, operation string,
 }
 
 // EtcdRegistry is a library for registering and retrieving service nodes from etcd.
+// leaseInfo tracks information about an active lease
+type leaseInfo struct {
+	id        clientv3.LeaseID
+	expiresAt time.Time
+	ttl       time.Duration
+}
+
+// circuitBreaker implements basic circuit breaker pattern
+type circuitBreaker struct {
+	failures  int
+	lastFail  time.Time
+	isOpen    bool
+	openUntil time.Time
+	mu        sync.RWMutex
+}
+
 type EtcdRegistry struct {
 	etcdBasePath   string
 	etcdUsername   string
@@ -118,6 +144,13 @@ type EtcdRegistry struct {
 	defaultTimeout time.Duration
 	maxRetries     int
 	logger         *logrus.Entry
+
+	// Lease management
+	leaseCache   map[string]*leaseInfo // key -> lease info
+	leaseCacheMu sync.RWMutex
+
+	// Circuit breaker
+	circuitBreaker *circuitBreaker
 
 	// Connection management
 	client          *clientv3.Client
@@ -181,7 +214,9 @@ func NewEtcdRegistry(etcdEndpoints []string, etcdBasePath string, etcdUsername s
 		etcdPassword:        etcdPassword,
 		maxRetries:          maxRetries,
 		connectionState:     stateDisconnected,
-		leaseCleanupLimiter: rate.NewLimiter(rate.Every(100*time.Millisecond), 1), // Max 10 ops/sec
+		leaseCleanupLimiter: rate.NewLimiter(rate.Limit(maxLeaseOperationsPerSecond), 1),
+		leaseCache:          make(map[string]*leaseInfo),
+		circuitBreaker:      &circuitBreaker{},
 	}
 
 	// Try to connect first, before creating any goroutines or resources
@@ -195,9 +230,29 @@ func NewEtcdRegistry(etcdEndpoints []string, etcdBasePath string, etcdUsername s
 	r.cancel = cancel
 	r.healthTicker = time.NewTicker(healthCheckInterval)
 
-	// Start health monitoring
+	// Start health monitoring with jitter
 	r.wg.Add(1)
-	go r.monitorHealth()
+	go func() {
+		defer r.wg.Done()
+
+		// Create ticker with jitter
+		jitter := time.Duration(rand.Int63n(int64(healthCheckJitterMax)))
+		ticker := time.NewTicker(healthCheckInterval + jitter)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-r.ctx.Done():
+				return
+			case <-ticker.C:
+				if err := r.checkHealth(); err != nil {
+					r.circuitBreaker.recordFailure()
+				} else {
+					r.circuitBreaker.reset()
+				}
+			}
+		}
+	}()
 
 	return r, nil
 }
@@ -210,23 +265,27 @@ func (r *EtcdRegistry) Close() error {
 	// Wait for all goroutines to finish
 	r.wg.Wait()
 
-	// Clean up any lingering leases with rate limiting
+	// Cleanup lease cache and revoke leases
 	if r.client != nil {
 		ctx := context.Background()
 
-		// Best effort cleanup - don't fail if this errors
-		if leases, err := r.client.Lease.Leases(ctx); err == nil {
-			for _, lease := range leases.Leases {
+		r.leaseCacheMu.Lock()
+		for key, lease := range r.leaseCache {
+			// Only cleanup expired leases
+			if time.Now().After(lease.expiresAt) {
 				if err := r.leaseCleanupLimiter.Wait(ctx); err != nil {
 					r.logger.WithError(err).Warn("Rate limit exceeded during lease cleanup")
 					continue
 				}
-				_, err := r.client.Lease.Revoke(ctx, lease.ID)
+
+				_, err := r.client.Lease.Revoke(ctx, lease.id)
 				if err != nil && !strings.Contains(err.Error(), "lease not found") {
 					r.logger.WithError(err).Error("Failed to revoke lease")
 				}
+				delete(r.leaseCache, key)
 			}
 		}
+		r.leaseCacheMu.Unlock()
 	}
 
 	// Close client connection
@@ -333,13 +392,47 @@ func (r *EtcdRegistry) RegisterNodeWithRetry(ctx context.Context, groupName stri
 }
 
 func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, node types.Node, ttl time.Duration) error {
+	// Check circuit breaker
+	if !r.circuitBreaker.canTry() {
+		return fmt.Errorf("circuit breaker is open")
+	}
+
 	// Check client state
 	if r.client == nil {
 		return fmt.Errorf("etcd client connection unavailable")
 	}
 
-	// Check for and cleanup any existing lease for this node
+	// Try to reuse existing lease
 	nodePath := r.NodePath(serviceName, node)
+	cacheKey := fmt.Sprintf("%s/%s", serviceName, node.ID)
+
+	r.leaseCacheMu.RLock()
+	existingLease, exists := r.leaseCache[cacheKey]
+	r.leaseCacheMu.RUnlock()
+
+	if exists && time.Now().Before(existingLease.expiresAt) {
+		// Verify lease is still valid
+		_, err := r.client.TimeToLive(ctx, existingLease.id)
+		if err == nil {
+			// Reuse existing lease
+			nodeData, err := json.Marshal(node)
+			if err != nil {
+				return fmt.Errorf("failed to marshal node data: %w", err)
+			}
+
+			_, err = r.client.Put(ctx, nodePath, string(nodeData), clientv3.WithLease(existingLease.id))
+			if err == nil {
+				return nil
+			}
+		}
+		// If verification failed, remove from cache
+		r.leaseCacheMu.Lock()
+		delete(r.leaseCache, cacheKey)
+		r.leaseCacheMu.Unlock()
+	}
+
+	// Check for and cleanup any existing lease for this node
+	nodePath = r.NodePath(serviceName, node)
 	resp, err := r.client.Get(ctx, nodePath)
 	if err == nil && len(resp.Kvs) > 0 {
 		if lease := resp.Kvs[0].Lease; lease != 0 {
@@ -349,11 +442,28 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 		}
 	}
 
-	// Create lease with timeout context
+	// Rate limit lease creation
+	if err := r.leaseCleanupLimiter.Wait(ctx); err != nil {
+		return fmt.Errorf("lease operation rate limit exceeded: %w", err)
+	}
+
+	// Create new lease
 	leaseResp, err := r.client.Grant(ctx, int64(ttl.Seconds()))
 	if err != nil {
+		if r.circuitBreaker.recordFailure() {
+			r.logger.Warn("Circuit breaker opened due to lease creation failures")
+		}
 		return fmt.Errorf("failed to grant lease: %w", err)
 	}
+
+	// Cache the new lease
+	r.leaseCacheMu.Lock()
+	r.leaseCache[cacheKey] = &leaseInfo{
+		id:        leaseResp.ID,
+		expiresAt: time.Now().Add(ttl),
+		ttl:       ttl,
+	}
+	r.leaseCacheMu.Unlock()
 
 	// Put with lease using timeout context
 	nodePath = r.NodePath(serviceName, node)
@@ -680,6 +790,51 @@ func (r *EtcdRegistry) connect(ctx context.Context) error {
 
 	r.logger.Info("Successfully connected to etcd")
 	return nil
+}
+
+// recordFailure records a failure in the circuit breaker
+func (cb *circuitBreaker) recordFailure() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.failures++
+	cb.lastFail = time.Now()
+
+	if cb.failures >= circuitBreakerThreshold {
+		cb.isOpen = true
+		cb.openUntil = time.Now().Add(circuitBreakerTimeout)
+		return true
+	}
+	return false
+}
+
+// canTry checks if the circuit breaker allows an operation
+func (cb *circuitBreaker) canTry() bool {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+
+	if !cb.isOpen {
+		return true
+	}
+
+	if time.Now().After(cb.openUntil) {
+		cb.mu.Lock()
+		cb.isOpen = false
+		cb.failures = 0
+		cb.mu.Unlock()
+		return true
+	}
+	return false
+}
+
+// reset resets the circuit breaker state
+func (cb *circuitBreaker) reset() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.failures = 0
+	cb.isOpen = false
+	cb.lastFail = time.Time{}
 }
 
 // monitorHealth continuously monitors connection health
