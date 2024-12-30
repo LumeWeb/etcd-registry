@@ -475,47 +475,15 @@ func (r *EtcdRegistry) registerNode(ctx context.Context, serviceName string, nod
 		return fmt.Errorf("failed to put node data: %w", err)
 	}
 
-	// Start keepalive with parent context
-	keepAlive, err := r.client.KeepAlive(ctx, leaseResp.ID)
-	if err != nil {
-		// Skip lease cleanup on failed keepalive, let it expire naturally
-		return fmt.Errorf("failed to start keepalive: %w", err)
+	// Start keepalive monitoring
+	if err := r.monitorKeepAlive(ctx, serviceName, node, leaseResp.ID); err != nil {
+		return fmt.Errorf("failed to start keepalive monitoring: %w", err)
 	}
 
 	r.logger.WithFields(logrus.Fields{
-		"node":     node.ID,
+		"node":    node.ID,
 		"leaseID": leaseResp.ID,
 	}).Debug("Created new lease")
-
-	// Monitor keepalive responses in a goroutine
-	go func() {
-		defer func() {
-			if err := r.DeleteNode(ctx, serviceName, node); err != nil {
-				r.logger.WithError(err).Error("Failed to cleanup node")
-			}
-		}()
-
-		for {
-			select {
-			case ka, ok := <-keepAlive:
-				if !ok {
-					// Channel closed - lease expired or connection lost
-					r.logger.WithField("node_id", node.ID).Info("Keepalive channel closed")
-					return
-				}
-				if ka != nil {
-					r.logger.WithFields(logrus.Fields{
-						"node_id":  node.ID,
-						"lease_id": ka.ID,
-						"ttl":      ka.TTL,
-					}).Debug("Keepalive successful")
-				}
-			case <-ctx.Done():
-				r.logger.WithField("node_id", node.ID).Info("Registration context cancelled")
-				return
-			}
-		}
-	}()
 
 	return nil
 }
@@ -1154,6 +1122,75 @@ func (r *EtcdRegistry) WatchGroupNodes(ctx context.Context, groupName string) (<
 	}()
 
 	return eventChan, nil
+}
+
+// monitorKeepAlive handles keepalive monitoring and retry logic for a lease
+func (r *EtcdRegistry) monitorKeepAlive(ctx context.Context, serviceName string, node types.Node, leaseID clientv3.LeaseID) error {
+	keepAlive, err := r.client.KeepAlive(ctx, leaseID)
+	if err != nil {
+		return fmt.Errorf("failed to start keepalive: %w", err)
+	}
+
+	go func() {
+		defer func() {
+			if err := r.DeleteNode(ctx, serviceName, node); err != nil {
+				r.logger.WithError(err).Error("Failed to cleanup node")
+			}
+		}()
+
+		attempt := 0
+		for {
+			select {
+			case ka, ok := <-keepAlive:
+				if !ok {
+					// Only attempt retry if not shutting down
+					select {
+					case <-ctx.Done():
+						r.logger.WithField("node_id", node.ID).Info("Registration context cancelled")
+						return
+					default:
+						attempt++
+						backoff := calculateBackoff(attempt)
+						r.logger.WithFields(logrus.Fields{
+							"node_id": node.ID,
+							"attempt": attempt,
+							"backoff": backoff,
+						}).Info("Keepalive channel closed, attempting to reclaim lease")
+
+						// Wait for backoff period
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(backoff):
+						}
+
+						// Attempt to reclaim lease
+						newKeepAlive, err := r.client.KeepAlive(ctx, leaseID)
+						if err != nil {
+							r.logger.WithError(err).WithField("node_id", node.ID).Error("Failed to reclaim lease")
+							continue
+						}
+						keepAlive = newKeepAlive
+						attempt = 0 // Reset attempt counter on successful reclaim
+					}
+					continue
+				}
+				if ka != nil {
+					r.logger.WithFields(logrus.Fields{
+						"node_id":  node.ID,
+						"lease_id": ka.ID,
+						"ttl":      ka.TTL,
+					}).Debug("Keepalive successful")
+					attempt = 0 // Reset attempt counter on successful keepalive
+				}
+			case <-ctx.Done():
+				r.logger.WithField("node_id", node.ID).Info("Registration context cancelled")
+				return
+			}
+		}
+	}()
+
+	return nil
 }
 
 // GetEtcdBasePath returns the base path for etcd operations
